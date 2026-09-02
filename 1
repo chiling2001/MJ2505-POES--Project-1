@@ -1,0 +1,2021 @@
+# ============================================================
+# MJ2505 - Project 1
+# STEP 1
+#
+# Step 1.1 Baseline Network Analysis
+# Step 1.2 N-1 Contingency Analysis
+# Step 1.3 Critical Line Identification
+# ============================================================
+
+
+# ============================================================
+# 0. 导入需要的库
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import pandapower as pp
+import pandapower.networks as pn
+import pandapower.contingency
+
+from IPython.display import display
+
+
+# 显示完整表格
+pd.set_option("display.max_rows", None)
+pd.set_option("display.max_columns", None)
+
+
+
+# ============================================================
+# STEP 1.1
+# BASELINE NETWORK ANALYSIS
+# ============================================================
+
+
+# ============================================================
+# 1. 建立 CIGRE MV 标准网络
+# ============================================================
+
+# 使用 pandapower 内置 CIGRE MV 网络
+# with_der=False 表示不加入 DER
+net = pn.create_cigre_network_mv(
+    with_der=False
+)
+
+print("\n===== NETWORK CREATED =====")
+print(net)
+
+
+
+# ============================================================
+# 2. 查看网络输入数据
+# ============================================================
+
+print("\n===== BUS DATA =====")
+display(net.bus)
+
+print("\n===== LINE DATA =====")
+display(net.line)
+
+print("\n===== TRANSFORMER DATA =====")
+display(net.trafo)
+
+print("\n===== LOAD DATA =====")
+display(net.load)
+
+print("\n===== SWITCH DATA =====")
+display(net.switch)
+
+
+
+# ============================================================
+# 3. 运行 Baseline AC Power Flow
+# ============================================================
+
+pp.runpp(
+    net,
+    numba=False
+)
+
+print("\n===== POWER FLOW STATUS =====")
+
+print(
+    "Power flow converged:",
+    net.converged
+)
+
+
+
+# ============================================================
+# 4. 定义运行限制
+# ============================================================
+
+# 母线电压范围
+V_MIN = 0.90
+V_MAX = 1.10
+
+# 线路最大负载率
+LINE_LIMIT = 100.0
+
+# 变压器额定负载率参考
+TRAFO_LIMIT = 100.0
+
+
+
+# ============================================================
+# 5. 母线电压结果
+# ============================================================
+
+bus_results = pd.DataFrame({
+
+    "bus_index":
+        net.bus.index,
+
+    "bus_name":
+        net.bus["name"],
+
+    "vn_kv":
+        net.bus["vn_kv"],
+
+    "vm_pu":
+        net.res_bus["vm_pu"],
+
+    "va_degree":
+        net.res_bus["va_degree"]
+})
+
+
+print("\n===== BUS VOLTAGE RESULTS =====")
+
+display(
+    bus_results
+)
+
+
+
+# ============================================================
+# 6. 检查 Voltage Violation
+# ============================================================
+
+voltage_violations = bus_results[
+
+    (bus_results["vm_pu"] < V_MIN)
+
+    |
+
+    (bus_results["vm_pu"] > V_MAX)
+
+]
+
+
+print("\n===== VOLTAGE VIOLATIONS =====")
+
+
+if voltage_violations.empty:
+
+    print(
+        "No voltage violations were found."
+    )
+
+else:
+
+    display(
+        voltage_violations
+    )
+
+
+
+# ============================================================
+# 7. 找最低和最高 Bus Voltage
+# ============================================================
+
+min_voltage_index = (
+    bus_results["vm_pu"].idxmin()
+)
+
+max_voltage_index = (
+    bus_results["vm_pu"].idxmax()
+)
+
+
+print("\n===== MINIMUM BUS VOLTAGE =====")
+
+display(
+    bus_results.loc[
+        [min_voltage_index]
+    ]
+)
+
+
+print("\n===== MAXIMUM BUS VOLTAGE =====")
+
+display(
+    bus_results.loc[
+        [max_voltage_index]
+    ]
+)
+
+
+
+# ============================================================
+# 8. 线路潮流和负载率
+# ============================================================
+
+line_results = pd.DataFrame({
+
+    "line_index":
+        net.line.index,
+
+    "line_name":
+        net.line["name"],
+
+    "from_bus":
+        net.line["from_bus"],
+
+    "to_bus":
+        net.line["to_bus"],
+
+    "p_from_mw":
+        net.res_line["p_from_mw"],
+
+    "q_from_mvar":
+        net.res_line["q_from_mvar"],
+
+    "p_to_mw":
+        net.res_line["p_to_mw"],
+
+    "q_to_mvar":
+        net.res_line["q_to_mvar"],
+
+    "loading_percent":
+        net.res_line["loading_percent"]
+})
+
+
+print("\n===== LINE RESULTS =====")
+
+display(
+    line_results
+)
+
+
+
+# ============================================================
+# 9. 按 Line Loading 排序
+# ============================================================
+
+line_results_sorted = (
+    line_results
+    .sort_values(
+        by="loading_percent",
+        ascending=False
+    )
+)
+
+
+print("\n===== LINES SORTED BY LOADING =====")
+
+display(
+    line_results_sorted
+)
+
+
+
+# ============================================================
+# 10. 检查 Line Overload
+# ============================================================
+
+line_violations = line_results[
+
+    line_results[
+        "loading_percent"
+    ] > LINE_LIMIT
+
+]
+
+
+print(
+    "\n===== LINE LOADING VIOLATIONS ====="
+)
+
+
+if line_violations.empty:
+
+    print(
+        "No line loading violations were found."
+    )
+
+else:
+
+    display(
+        line_violations
+    )
+
+
+
+# ============================================================
+# 11. 找负载率最高的线路
+# ============================================================
+
+max_line_index = (
+    line_results[
+        "loading_percent"
+    ].idxmax()
+)
+
+
+print(
+    "\n===== MOST HEAVILY LOADED LINE ====="
+)
+
+display(
+    line_results.loc[
+        [max_line_index]
+    ]
+)
+
+
+
+# ============================================================
+# 12. Transformer Results
+# ============================================================
+
+trafo_results = pd.DataFrame({
+
+    "trafo_index":
+        net.trafo.index,
+
+    "trafo_name":
+        net.trafo["name"],
+
+    "hv_bus":
+        net.trafo["hv_bus"],
+
+    "lv_bus":
+        net.trafo["lv_bus"],
+
+    "p_hv_mw":
+        net.res_trafo["p_hv_mw"],
+
+    "q_hv_mvar":
+        net.res_trafo["q_hv_mvar"],
+
+    "loading_percent":
+        net.res_trafo["loading_percent"]
+})
+
+
+print(
+    "\n===== TRANSFORMER RESULTS ====="
+)
+
+display(
+    trafo_results
+)
+
+
+
+# ============================================================
+# 13. 检查 Transformer Loading
+# ============================================================
+
+trafo_violations = trafo_results[
+
+    trafo_results[
+        "loading_percent"
+    ] > TRAFO_LIMIT
+
+]
+
+
+print(
+    "\n===== TRANSFORMER LOADING > 100% ====="
+)
+
+
+if trafo_violations.empty:
+
+    print(
+        "No transformer loading above 100% was found."
+    )
+
+else:
+
+    display(
+        trafo_violations
+    )
+
+
+
+# ============================================================
+# 14. 找负载率最高的 Transformer
+# ============================================================
+
+max_trafo_index = (
+    trafo_results[
+        "loading_percent"
+    ].idxmax()
+)
+
+
+print(
+    "\n===== MOST HEAVILY LOADED TRANSFORMER ====="
+)
+
+display(
+    trafo_results.loc[
+        [max_trafo_index]
+    ]
+)
+
+
+
+# ============================================================
+# 15. Step 1.1 Summary
+# ============================================================
+
+min_voltage = (
+    bus_results["vm_pu"].min()
+)
+
+max_voltage = (
+    bus_results["vm_pu"].max()
+)
+
+
+min_voltage_bus = (
+    bus_results.loc[
+        bus_results["vm_pu"].idxmin(),
+        "bus_name"
+    ]
+)
+
+
+max_voltage_bus = (
+    bus_results.loc[
+        bus_results["vm_pu"].idxmax(),
+        "bus_name"
+    ]
+)
+
+
+max_line_loading = (
+    line_results[
+        "loading_percent"
+    ].max()
+)
+
+
+max_line_name = (
+    line_results.loc[
+        line_results[
+            "loading_percent"
+        ].idxmax(),
+        "line_name"
+    ]
+)
+
+
+max_trafo_loading = (
+    trafo_results[
+        "loading_percent"
+    ].max()
+)
+
+
+max_trafo_name = (
+    trafo_results.loc[
+        trafo_results[
+            "loading_percent"
+        ].idxmax(),
+        "trafo_name"
+    ]
+)
+
+
+print(
+    "\n========================================"
+)
+
+print(
+    "STEP 1.1 BASELINE NETWORK SUMMARY"
+)
+
+print(
+    "========================================"
+)
+
+
+print(
+    f"Power flow converged: "
+    f"{net.converged}"
+)
+
+
+print(
+    f"Minimum bus voltage: "
+    f"{min_voltage:.4f} pu "
+    f"at {min_voltage_bus}"
+)
+
+
+print(
+    f"Maximum bus voltage: "
+    f"{max_voltage:.4f} pu "
+    f"at {max_voltage_bus}"
+)
+
+
+print(
+    f"Maximum line loading: "
+    f"{max_line_loading:.2f}% "
+    f"at {max_line_name}"
+)
+
+
+print(
+    f"Maximum transformer loading: "
+    f"{max_trafo_loading:.2f}% "
+    f"at {max_trafo_name}"
+)
+
+
+print(
+    f"Number of voltage violations: "
+    f"{len(voltage_violations)}"
+)
+
+
+print(
+    f"Number of line loading violations: "
+    f"{len(line_violations)}"
+)
+
+
+print(
+    f"Number of transformers above 100%: "
+    f"{len(trafo_violations)}"
+)
+
+
+
+# ============================================================
+# 16. 绘制 Baseline Bus Voltage
+# ============================================================
+
+plt.figure(
+    figsize=(10, 5)
+)
+
+
+plt.plot(
+    bus_results["bus_index"],
+    bus_results["vm_pu"],
+    marker="o",
+    label="Bus voltage"
+)
+
+
+plt.axhline(
+    V_MIN,
+    linestyle="--",
+    label="Minimum limit = 0.90 pu"
+)
+
+
+plt.axhline(
+    V_MAX,
+    linestyle="--",
+    label="Maximum limit = 1.10 pu"
+)
+
+
+plt.xlabel(
+    "Bus index"
+)
+
+plt.ylabel(
+    "Voltage [pu]"
+)
+
+plt.title(
+    "Baseline Bus Voltage Profile"
+)
+
+plt.grid(
+    True
+)
+
+plt.legend()
+
+plt.show()
+
+
+
+# ============================================================
+# 17. 绘制 Baseline Line Loading
+# ============================================================
+
+plt.figure(
+    figsize=(10, 5)
+)
+
+
+plt.bar(
+    line_results["line_index"],
+    line_results["loading_percent"]
+)
+
+
+plt.axhline(
+    LINE_LIMIT,
+    linestyle="--",
+    label="Maximum loading = 100%"
+)
+
+
+plt.xlabel(
+    "Line index"
+)
+
+plt.ylabel(
+    "Line loading [%]"
+)
+
+plt.title(
+    "Baseline Line Loading"
+)
+
+plt.legend()
+
+plt.show()
+
+
+
+# ============================================================
+# STEP 1.2
+# N-1 CONTINGENCY ANALYSIS
+# ============================================================
+
+
+# ============================================================
+# 18. 设置 Contingency Limits
+# ============================================================
+
+net.bus[
+    "min_vm_pu"
+] = V_MIN
+
+net.bus[
+    "max_vm_pu"
+] = V_MAX
+
+net.line[
+    "max_loading_percent"
+] = LINE_LIMIT
+
+net.trafo[
+    "max_loading_percent"
+] = TRAFO_LIMIT
+
+
+
+# ============================================================
+# 19. 定义三个 Tie Switch
+# ============================================================
+#
+# 正确对应：
+#
+# S1 = Line 14-8
+# S2 = Line 6-7
+# S3 = Line 11-4
+
+tie_lines = {
+
+    "S1": "Line 14-8",
+
+    "S2": "Line 6-7",
+
+    "S3": "Line 11-4"
+}
+
+
+
+# ============================================================
+# 20. 找 Tie Line Index
+# ============================================================
+
+tie_line_indices = {}
+
+
+for switch_name, line_name in tie_lines.items():
+
+    match = net.line[
+
+        net.line[
+            "name"
+        ] == line_name
+
+    ].index
+
+
+    if len(match) != 1:
+
+        raise ValueError(
+            f"{line_name} 没有找到唯一 line index"
+        )
+
+
+    tie_line_indices[
+        switch_name
+    ] = match[0]
+
+
+
+# ============================================================
+# 21. 找三个常开 Switch
+# ============================================================
+
+tie_switch_indices = {}
+
+
+for switch_name, line_index in tie_line_indices.items():
+
+    match = net.switch[
+
+        (net.switch["et"] == "l")
+
+        &
+
+        (
+            net.switch[
+                "element"
+            ] == line_index
+        )
+
+        &
+
+        (
+            net.switch[
+                "closed"
+            ] == False
+        )
+
+    ].index
+
+
+    if len(match) != 1:
+
+        raise ValueError(
+            f"{switch_name} "
+            "没有找到唯一的常开 switch"
+        )
+
+
+    tie_switch_indices[
+        switch_name
+    ] = match[0]
+
+
+
+# ============================================================
+# 22. 检查 Switch Mapping
+# ============================================================
+
+switch_mapping = pd.DataFrame({
+
+    "switch": [
+        "S1",
+        "S2",
+        "S3"
+    ],
+
+    "tie_line": [
+        tie_lines["S1"],
+        tie_lines["S2"],
+        tie_lines["S3"]
+    ],
+
+    "line_index": [
+        tie_line_indices["S1"],
+        tie_line_indices["S2"],
+        tie_line_indices["S3"]
+    ],
+
+    "switch_index": [
+        tie_switch_indices["S1"],
+        tie_switch_indices["S2"],
+        tie_switch_indices["S3"]
+    ]
+})
+
+
+print(
+    "\n===== SWITCH MAPPING ====="
+)
+
+display(
+    switch_mapping
+)
+
+
+
+# ============================================================
+# 23. 保存原始网络状态
+# ============================================================
+
+original_line_state = (
+    net.line[
+        "in_service"
+    ].copy()
+)
+
+
+original_switch_state = (
+    net.switch[
+        "closed"
+    ].copy()
+)
+
+
+
+# ============================================================
+# 24. 定义四种 Switch Configuration
+# ============================================================
+#
+# False = Open
+# True = Closed
+#
+# Base:
+# 全部打开
+#
+# Config 1:
+# S1 Closed
+#
+# Config 2:
+# S2 Closed
+#
+# Config 3:
+# S3 Closed
+
+switch_configs = {
+
+    "Base": {
+
+        "S1": False,
+        "S2": False,
+        "S3": False
+    },
+
+
+    "Config 1": {
+
+        "S1": True,
+        "S2": False,
+        "S3": False
+    },
+
+
+    "Config 2": {
+
+        "S1": False,
+        "S2": True,
+        "S3": False
+    },
+
+
+    "Config 3": {
+
+        "S1": False,
+        "S2": False,
+        "S3": True
+    }
+}
+
+
+
+# ============================================================
+# 25. 设置 Switch Configuration
+# ============================================================
+
+def set_switch_config(config):
+
+    # 先恢复原始状态
+    net.switch[
+        "closed"
+    ] = original_switch_state.copy()
+
+
+    # 设置 S1 / S2 / S3
+    for switch_name, closed_state in config.items():
+
+        switch_index = (
+            tie_switch_indices[
+                switch_name
+            ]
+        )
+
+
+        net.switch.loc[
+            switch_index,
+            "closed"
+        ] = closed_state
+
+
+
+# ============================================================
+# 26. 找需要测试的 12 条线路
+# ============================================================
+
+tie_line_names = list(
+    tie_lines.values()
+)
+
+
+# 排除三条 Tie Line
+contingency_lines = net.line[
+
+    ~net.line[
+        "name"
+    ].isin(
+        tie_line_names
+    )
+
+].index.tolist()
+
+
+print(
+    "\n===== N-1 CONTINGENCY LINES ====="
+)
+
+
+display(
+    net.line.loc[
+        contingency_lines,
+        [
+            "name",
+            "from_bus",
+            "to_bus"
+        ]
+    ]
+)
+
+
+print(
+    "Number of contingency lines:",
+    len(contingency_lines)
+)
+
+
+if len(contingency_lines) != 12:
+
+    raise ValueError(
+        "N-1 outage line 数量不是 12。"
+    )
+
+
+
+# ============================================================
+# 27. 运行 N-1 Contingency Analysis
+# ============================================================
+
+all_results = []
+
+
+try:
+
+    # 遍历四种 configuration
+    for config_name, config in switch_configs.items():
+
+        print(
+            "\n===================================="
+        )
+
+        print(
+            "Testing:",
+            config_name
+        )
+
+        print(
+            "===================================="
+        )
+
+
+        # 设置当前开关状态
+        set_switch_config(
+            config
+        )
+
+
+        # 遍历 12 条线路
+        for line_index in contingency_lines:
+
+            line_name = net.line.loc[
+                line_index,
+                "name"
+            ]
+
+
+            # 定义单线路 N-1
+            nminus1_cases = {
+
+                "line": {
+
+                    "index":
+                        np.array(
+                            [line_index],
+                            dtype=int
+                        )
+                }
+            }
+
+
+            try:
+
+                # ============================================
+                # 运行 Contingency
+                # ============================================
+
+                res = (
+                    pp.contingency.run_contingency(
+
+                        net,
+
+                        nminus1_cases,
+
+                        pf_options={
+                            "numba": False
+                        },
+
+                        pf_options_nminus1={
+                            "numba": False
+                        }
+                    )
+                )
+
+
+                # ============================================
+                # BUS RESULTS
+                # ============================================
+
+                bus_indices = np.array(
+                    res["bus"]["index"]
+                )
+
+
+                bus_min_values = np.array(
+                    res["bus"]["min_vm_pu"],
+                    dtype=float
+                )
+
+
+                bus_max_values = np.array(
+                    res["bus"]["max_vm_pu"],
+                    dtype=float
+                )
+
+
+                # ============================================
+                # 检查 Unsupplied Bus
+                # ============================================
+
+                unsupplied_mask = np.isnan(
+                    bus_min_values
+                )
+
+
+                unsupplied = (
+                    unsupplied_mask.any()
+                )
+
+
+                unsupplied_bus_indices = (
+                    bus_indices[
+                        unsupplied_mask
+                    ]
+                )
+
+
+                unsupplied_bus_names = [
+
+                    net.bus.loc[
+                        idx,
+                        "name"
+                    ]
+
+                    for idx
+                    in unsupplied_bus_indices
+                ]
+
+
+                # ============================================
+                # 找最低 Bus Voltage
+                # ============================================
+
+                supplied_mask = (
+                    ~np.isnan(
+                        bus_min_values
+                    )
+                )
+
+
+                if supplied_mask.any():
+
+                    min_position = (
+                        np.nanargmin(
+                            bus_min_values
+                        )
+                    )
+
+
+                    min_voltage = (
+                        bus_min_values[
+                            min_position
+                        ]
+                    )
+
+
+                    min_bus_index = (
+                        bus_indices[
+                            min_position
+                        ]
+                    )
+
+
+                    min_voltage_bus = (
+                        net.bus.loc[
+                            min_bus_index,
+                            "name"
+                        ]
+                    )
+
+
+                else:
+
+                    min_voltage = np.nan
+
+                    min_voltage_bus = None
+
+
+                # ============================================
+                # 找最高 Bus Voltage
+                # ============================================
+
+                if (
+                    ~np.isnan(
+                        bus_max_values
+                    )
+                ).any():
+
+                    max_position = (
+                        np.nanargmax(
+                            bus_max_values
+                        )
+                    )
+
+
+                    max_voltage = (
+                        bus_max_values[
+                            max_position
+                        ]
+                    )
+
+
+                    max_bus_index = (
+                        bus_indices[
+                            max_position
+                        ]
+                    )
+
+
+                    max_voltage_bus = (
+                        net.bus.loc[
+                            max_bus_index,
+                            "name"
+                        ]
+                    )
+
+
+                else:
+
+                    max_voltage = np.nan
+
+                    max_voltage_bus = None
+
+
+                # ============================================
+                # LINE RESULTS
+                # ============================================
+
+                line_indices = np.array(
+                    res["line"]["index"]
+                )
+
+
+                line_loading_values = np.array(
+
+                    res["line"][
+                        "max_loading_percent"
+                    ],
+
+                    dtype=float
+                )
+
+
+                # ============================================
+                # 找最大 Line Loading
+                # ============================================
+
+                if (
+                    ~np.isnan(
+                        line_loading_values
+                    )
+                ).any():
+
+                    max_line_position = (
+                        np.nanargmax(
+                            line_loading_values
+                        )
+                    )
+
+
+                    max_line_loading = (
+                        line_loading_values[
+                            max_line_position
+                        ]
+                    )
+
+
+                    max_line_index_case = (
+                        line_indices[
+                            max_line_position
+                        ]
+                    )
+
+
+                    max_loading_line = (
+                        net.line.loc[
+                            max_line_index_case,
+                            "name"
+                        ]
+                    )
+
+
+                else:
+
+                    max_line_loading = np.nan
+
+                    max_loading_line = None
+
+
+                # ============================================
+                # 判断 Voltage Violation
+                # ============================================
+
+                voltage_violation = False
+
+
+                if not np.isnan(
+                    min_voltage
+                ):
+
+                    if min_voltage < V_MIN:
+
+                        voltage_violation = True
+
+
+                if not np.isnan(
+                    max_voltage
+                ):
+
+                    if max_voltage > V_MAX:
+
+                        voltage_violation = True
+
+
+                # ============================================
+                # 判断 Line Overload
+                # ============================================
+
+                line_violation = False
+
+
+                if not np.isnan(
+                    max_line_loading
+                ):
+
+                    if (
+                        max_line_loading
+                        > LINE_LIMIT
+                    ):
+
+                        line_violation = True
+
+
+                # ============================================
+                # 判断该 Case 是否违反要求
+                # ============================================
+
+                any_violation = (
+
+                    unsupplied
+
+                    or
+
+                    voltage_violation
+
+                    or
+
+                    line_violation
+                )
+
+
+                # ============================================
+                # 保存 Case 结果到内存
+                # ============================================
+
+                all_results.append({
+
+                    "configuration":
+                        config_name,
+
+                    "outage_line_index":
+                        line_index,
+
+                    "outage_line":
+                        line_name,
+
+                    "unsupplied":
+                        unsupplied,
+
+                    "unsupplied_buses":
+                        ", ".join(
+                            unsupplied_bus_names
+                        ),
+
+                    "min_voltage_pu":
+                        min_voltage,
+
+                    "min_voltage_bus":
+                        min_voltage_bus,
+
+                    "max_voltage_pu":
+                        max_voltage,
+
+                    "max_voltage_bus":
+                        max_voltage_bus,
+
+                    "max_line_loading_percent":
+                        max_line_loading,
+
+                    "max_loading_line":
+                        max_loading_line,
+
+                    "voltage_violation":
+                        voltage_violation,
+
+                    "line_violation":
+                        line_violation,
+
+                    "any_violation":
+                        any_violation,
+
+                    "error":
+                        None
+                })
+
+
+            # ================================================
+            # Calculation Error
+            # ================================================
+
+            except Exception as e:
+
+                all_results.append({
+
+                    "configuration":
+                        config_name,
+
+                    "outage_line_index":
+                        line_index,
+
+                    "outage_line":
+                        line_name,
+
+                    "unsupplied":
+                        np.nan,
+
+                    "unsupplied_buses":
+                        None,
+
+                    "min_voltage_pu":
+                        np.nan,
+
+                    "min_voltage_bus":
+                        None,
+
+                    "max_voltage_pu":
+                        np.nan,
+
+                    "max_voltage_bus":
+                        None,
+
+                    "max_line_loading_percent":
+                        np.nan,
+
+                    "max_loading_line":
+                        None,
+
+                    "voltage_violation":
+                        np.nan,
+
+                    "line_violation":
+                        np.nan,
+
+                    "any_violation":
+                        np.nan,
+
+                    "error":
+                        str(e)
+                })
+
+
+
+# ============================================================
+# 28. 恢复原始网络状态
+# ============================================================
+
+finally:
+
+    net.line[
+        "in_service"
+    ] = original_line_state.copy()
+
+
+    net.switch[
+        "closed"
+    ] = original_switch_state.copy()
+
+
+
+# 恢复后重新运行 Baseline
+pp.runpp(
+    net,
+    numba=False
+)
+
+
+print(
+    "\nNetwork restored:",
+    net.converged
+)
+
+
+
+# ============================================================
+# 29. 整理 Contingency Results
+# ============================================================
+
+contingency_results = pd.DataFrame(
+    all_results
+)
+
+
+
+# ============================================================
+# 30. 检查 Calculation Errors
+# ============================================================
+
+error_cases = contingency_results[
+
+    contingency_results[
+        "error"
+    ].notna()
+
+]
+
+
+if not error_cases.empty:
+
+    print(
+        "\n===== CALCULATION ERRORS ====="
+    )
+
+
+    display(
+        error_cases[
+            [
+                "configuration",
+                "outage_line",
+                "error"
+            ]
+        ]
+    )
+
+
+    raise RuntimeError(
+        "存在计算错误，请先修复。"
+    )
+
+
+
+# ============================================================
+# 31. 显示全部 N-1 Results
+# ============================================================
+
+print(
+    "\n===== ALL N-1 CONTINGENCY RESULTS ====="
+)
+
+
+display(
+    contingency_results.round(4)
+)
+
+
+print(
+    "\nTotal contingency cases:",
+    len(contingency_results)
+)
+
+
+# 12 lines × 4 configurations = 48
+if len(contingency_results) != 48:
+
+    raise ValueError(
+        "Contingency case 数量不是 48。"
+    )
+
+
+
+# ============================================================
+# 32. 找 Line Loading 最严重的 Cases
+# ============================================================
+
+worst_loading_cases = (
+
+    contingency_results
+
+    .sort_values(
+
+        by=
+            "max_line_loading_percent",
+
+        ascending=False
+    )
+)
+
+
+print(
+    "\n===== WORST CASES BY LINE LOADING ====="
+)
+
+
+display(
+    worst_loading_cases[
+        [
+            "configuration",
+            "outage_line",
+            "max_line_loading_percent",
+            "max_loading_line",
+            "min_voltage_pu",
+            "min_voltage_bus"
+        ]
+    ]
+    .head(15)
+    .round(4)
+)
+
+
+
+# ============================================================
+# 33. 找 Voltage 最严重的 Cases
+# ============================================================
+
+worst_voltage_cases = (
+
+    contingency_results
+
+    .sort_values(
+
+        by=
+            "min_voltage_pu",
+
+        ascending=True
+    )
+)
+
+
+print(
+    "\n===== WORST CASES BY BUS VOLTAGE ====="
+)
+
+
+display(
+    worst_voltage_cases[
+        [
+            "configuration",
+            "outage_line",
+            "min_voltage_pu",
+            "min_voltage_bus",
+            "max_line_loading_percent",
+            "max_loading_line"
+        ]
+    ]
+    .head(15)
+    .round(4)
+)
+
+
+
+# ============================================================
+# STEP 1.3
+# CRITICAL LINE IDENTIFICATION
+# ============================================================
+
+
+# ============================================================
+# 34. 找所有 Violation Cases
+# ============================================================
+#
+# 一个 Violation Case 表示：
+#
+# 某条线路 outage
+# +
+# 某种 configuration
+# +
+# 出现运行问题
+
+violation_cases = contingency_results[
+
+    contingency_results[
+        "any_violation"
+    ] == True
+
+].copy()
+
+
+
+# ============================================================
+# 35. 判断 Violation 原因
+# ============================================================
+
+def get_violation_reason(row):
+
+    reasons = []
+
+
+    if row[
+        "unsupplied"
+    ]:
+
+        reasons.append(
+            "Unsupplied bus"
+        )
+
+
+    if row[
+        "voltage_violation"
+    ]:
+
+        reasons.append(
+            "Voltage violation"
+        )
+
+
+    if row[
+        "line_violation"
+    ]:
+
+        reasons.append(
+            "Line overload"
+        )
+
+
+    return " + ".join(
+        reasons
+    )
+
+
+
+violation_cases[
+    "reason"
+] = violation_cases.apply(
+
+    get_violation_reason,
+
+    axis=1
+)
+
+
+
+# ============================================================
+# 36. 显示 Violation Cases
+# ============================================================
+
+print(
+    "\n===== VIOLATION CASES AND REASONS ====="
+)
+
+
+display(
+    violation_cases[
+        [
+            "configuration",
+            "outage_line",
+            "reason",
+            "unsupplied_buses",
+            "min_voltage_pu",
+            "min_voltage_bus",
+            "max_line_loading_percent",
+            "max_loading_line"
+        ]
+    ].round(4)
+)
+
+
+
+# ============================================================
+# 37. 每种 Configuration 下的 Violating Lines
+# ============================================================
+
+print(
+    "\n===== VIOLATING LINES BY CONFIGURATION ====="
+)
+
+
+for config_name in switch_configs.keys():
+
+    temp = violation_cases[
+
+        violation_cases[
+            "configuration"
+        ] == config_name
+
+    ]
+
+
+    violating_lines = (
+
+        temp[
+            "outage_line"
+        ]
+
+        .drop_duplicates()
+
+        .tolist()
+    )
+
+
+    print(
+        f"\n--- {config_name} ---"
+    )
+
+
+    if len(
+        violating_lines
+    ) == 0:
+
+        print(
+            "No violating lines."
+        )
+
+
+    else:
+
+        for line_name in violating_lines:
+
+            print(
+                "-",
+                line_name
+            )
+
+
+
+# ============================================================
+# 38. 汇总每一条 Outage Line
+# ============================================================
+
+line_summary_list = []
+
+
+for line_index in contingency_lines:
+
+    line_name = net.line.loc[
+        line_index,
+        "name"
+    ]
+
+
+    temp = contingency_results[
+
+        contingency_results[
+            "outage_line"
+        ] == line_name
+
+    ]
+
+
+    # 出现问题的 configuration
+    violating_configs = temp[
+
+        temp[
+            "any_violation"
+        ] == True
+
+    ][
+        "configuration"
+    ].tolist()
+
+
+    # 可以正常运行的 configuration
+    feasible_configs = temp[
+
+        temp[
+            "any_violation"
+        ] == False
+
+    ][
+        "configuration"
+    ].tolist()
+
+
+    line_summary_list.append({
+
+        "outage_line":
+            line_name,
+
+        "violating_configs":
+            ", ".join(
+                violating_configs
+            ),
+
+        "feasible_configs":
+            ", ".join(
+                feasible_configs
+            ),
+
+        "no_feasible_configuration":
+            len(
+                feasible_configs
+            ) == 0
+    })
+
+
+
+line_summary = pd.DataFrame(
+    line_summary_list
+)
+
+
+print(
+    "\n===== LINE CONTINGENCY SUMMARY ====="
+)
+
+
+display(
+    line_summary
+)
+
+
+
+# ============================================================
+# 39. 找最终 Critical Lines
+# ============================================================
+#
+# 如果一条线路 outage 后：
+#
+# Base
+# Config 1
+# Config 2
+# Config 3
+#
+# 全部都有问题，
+# 则不存在可行 switching configuration。
+
+critical_lines = line_summary[
+
+    line_summary[
+        "no_feasible_configuration"
+    ] == True
+
+].copy()
+
+
+print(
+    "\n===== FINAL CRITICAL LINES ====="
+)
+
+
+if critical_lines.empty:
+
+    print(
+        "Every outage has at least one feasible configuration."
+    )
+
+else:
+
+    display(
+        critical_lines
+    )
+
+
+
+# ============================================================
+# 40. 分类统计
+# ============================================================
+
+voltage_cases = contingency_results[
+
+    contingency_results[
+        "voltage_violation"
+    ] == True
+
+]
+
+
+line_overload_cases = contingency_results[
+
+    contingency_results[
+        "line_violation"
+    ] == True
+
+]
+
+
+unsupplied_cases = contingency_results[
+
+    contingency_results[
+        "unsupplied"
+    ] == True
+
+]
+
+
+
+# ============================================================
+# 41. Step 1.2 / 1.3 Summary
+# ============================================================
+
+print(
+    "\n========================================"
+)
+
+print(
+    "STEP 1.2 / 1.3 SUMMARY"
+)
+
+print(
+    "========================================"
+)
+
+
+print(
+    "Number of contingency lines:",
+    len(contingency_lines)
+)
+
+
+print(
+    "Number of switch configurations:",
+    len(switch_configs)
+)
+
+
+print(
+    "Total contingency cases:",
+    len(contingency_results)
+)
+
+
+print(
+    "Cases with violations:",
+    len(violation_cases)
+)
+
+
+print(
+    "Voltage violation cases:",
+    len(voltage_cases)
+)
+
+
+print(
+    "Line overload cases:",
+    len(line_overload_cases)
+)
+
+
+print(
+    "Unsupplied cases:",
+    len(unsupplied_cases)
+)
+
+
+print(
+    "Final critical lines:",
+    len(critical_lines)
+)
+
+
+
+# ============================================================
+# 42. 显示 Critical Line Names
+# ============================================================
+
+print(
+    "\n===== CRITICAL LINE NAMES ====="
+)
+
+
+for line_name in critical_lines[
+    "outage_line"
+]:
+
+    print(
+        "-",
+        line_name
+    )
