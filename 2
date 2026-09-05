@@ -1,0 +1,174 @@
+import pandapower as pp
+import pandapower.control as control
+import pandapower.timeseries as ts
+from pandapower.timeseries.data_sources.frame_data import DFData
+import pandas as pd
+import numpy as np
+
+# ============================================================
+# MJ2505 - Project 1
+# STEP 2
+# ============================================================
+
+# ============================================================
+# 0. 進入 Step 2 前置作業：將現有網路負載減半
+# ============================================================
+net.load['p_mw'] = net.load['p_mw'] / 2
+net.load['q_mvar'] = net.load['q_mvar'] / 2
+
+pp.runpp(net, numba=False)
+print("\n===== BASELINE LOAD REDUCED BY HALF =====")
+print(net.res_bus.head())
+
+# ============================================================
+# STEP 2.1 決定四個物流站點的連接點
+# ============================================================
+# 脆弱點：1-2, 2-3, 12-13, 13-14 --> bus 1 和 12 可以接大負載
+# feeder 2 容量充裕可以善用，缺點是備用電路必須經過line 1-2 和 2-3 這個瓶頸
+# bus 6 & 11 電壓不足的機率較大
+# bus 3 4 8 備援路線多，受影響機率小，但線路剩餘容量較小
+depot_buses = {
+    "ICA": 12,       
+    "PostNord": 1,  
+    "Mathem": 14,   
+    "Airmee": 8      
+}
+
+# ============================================================
+# STEP 2.2 匯入兩週負載分佈資料並設定時間序列分析
+# ============================================================
+file_path = "Load_profiles_Freight transports.xlsx"
+df_loads = pd.read_excel(file_path, sheet_name="Load_profiles_Freight transport")
+
+# 擷取對應欄位，並將 kW 轉換為 MW
+df_profiles = df_loads[['ICA', 'Postnord', 'Mathem', 'Airmee']] / 1000.0
+df_profiles.rename(columns={'Postnord': 'PostNord'}, inplace=True) # 統一名稱
+
+# 將四個站點的負載加入模型
+depot_load_indices = {}
+for depot, bus_idx in depot_buses.items():
+    idx = pp.create_load(net, bus=bus_idx, p_mw=0, name=f"Depot_{depot}")
+    depot_load_indices[depot] = idx
+
+# 建立時間序列控制器
+ds = DFData(df_profiles)
+for depot, load_idx in depot_load_indices.items():
+    control.ConstControl(net, element='load', variable='p_mw', element_index=[load_idx],
+                         data_source=ds, profile_name=depot)
+
+# 初始化 OutputWriter 以記錄每小時的電壓與線路負載
+ow = ts.OutputWriter(net, time_steps=range(len(df_profiles)), output_path=None)
+ow.log_variable('res_bus', 'vm_pu')
+ow.log_variable('res_line', 'loading_percent')
+
+# 執行時間序列負載流分析
+print("\n===== RUNNING TIME-SERIES LOAD FLOW =====")
+ts.run_timeseries(net, time_steps=range(len(df_profiles)))
+
+# ============================================================
+# STEP 2.3 分析峰值負載期間與網路效能
+# ============================================================
+bus_voltage_log = ow.output['res_bus.vm_pu']
+line_loading_log = ow.output['res_line.loading_percent']
+
+v_min_all = bus_voltage_log.min().min()
+v_max_all = bus_voltage_log.max().max()
+print(f"Overall Min Voltage: {v_min_all:.4f} pu")
+print(f"Overall Max Voltage: {v_max_all:.4f} pu")
+
+# 找出系統負載最重的一小時 (以線路最大負載為基準)
+max_loading_per_step = line_loading_log.max(axis=1)
+worst_hour = max_loading_per_step.idxmax()
+worst_loading_val = max_loading_per_step.max()
+
+print(f"\n===== WORST-CASE LOADING PERIOD =====")
+print(f"Worst Hour Index: {worst_hour}")
+print(f"Max Line Loading during this hour: {worst_loading_val:.2f}%")
+
+# ============================================================
+# 定義 N-1 執行函式 (掃描所有設定與線路)
+# ============================================================
+def run_full_n1(net, switch_configs, lines_to_test, v_min_limit, v_max_limit, loading_limit):
+    results = []
+    for config_name, config in switch_configs.items():
+        
+        # 處理開關狀態切換
+        for switch_identifier, state in config.items():
+            if isinstance(switch_identifier, str):
+                idx = net.switch[net.switch['name'] == switch_identifier].index
+                if not idx.empty:
+                    net.switch.loc[idx[0], 'closed'] = bool(state)
+            else:
+                net.switch.loc[int(switch_identifier), 'closed'] = bool(state)
+
+        for line_index in lines_to_test:
+            line_idx_int = int(line_index)
+            nminus1_cases = {"line": {"index": np.array([line_idx_int])}}
+            try:
+                res = pp.contingency.run_contingency(
+                    net, nminus1_cases,
+                    pf_options={"numba": False},
+                    pf_options_nminus1={"numba": False}
+                )
+                
+                # 【修正】：使用 pd.isna() 判斷孤島，並使用 np.nanmin/np.nanmax 忽略 NaN 提取極值
+                unsupplied = pd.isna(res["bus"]["vm_pu"]).any()
+                
+                min_vm = np.nanmin(res["bus"]["min_vm_pu"]) if len(res["bus"]["min_vm_pu"]) > 0 else np.nan
+                max_vm = np.nanmax(res["bus"]["max_vm_pu"]) if len(res["bus"]["max_vm_pu"]) > 0 else np.nan
+                max_load = np.nanmax(res["line"]["max_loading_percent"]) if len(res["line"]["max_loading_percent"]) > 0 else np.nan
+
+                v_violation = (min_vm < v_min_limit) or (max_vm > v_max_limit) if pd.notna(min_vm) else True
+                l_violation = max_load > loading_limit if pd.notna(max_load) else True
+                any_violation = v_violation or l_violation or unsupplied
+
+                results.append({
+                    "Configuration": config_name,
+                    "Outage_Line_Idx": line_idx_int,
+                    "Min_Voltage_pu": min_vm,
+                    "Max_Loading_%": max_load,
+                    "Violation": any_violation
+                })
+            except pp.optimal_powerflow.OPFNotConverged:
+                results.append({
+                    "Configuration": config_name,
+                    "Outage_Line_Idx": line_idx_int,
+                    "Violation": True,
+                    "Error": "Not Converged"
+                })
+            finally:
+                net.line.loc[line_idx_int, 'in_service'] = True
+                
+    return pd.DataFrame(results)
+
+# 準備 N-1 測試目標
+# 註：需確保 switch_configs (Base, Config1~3) 已在 Step 1 宣告並存在於記憶體中
+lines_to_test = net.line[~net.line['name'].isin(["Line 14-8", "Line 6-7", "Line 11-4"])].index.values
+
+# 將網路狀態設定為 worst_hour 的負載狀態
+for depot, load_idx in depot_load_indices.items():
+    net.load.loc[load_idx, 'p_mw'] = df_profiles.loc[worst_hour, depot]
+
+pp.runpp(net, numba=False)
+
+# ============================================================
+# STEP 2.4 最糟負載時段的 N-1 偶發事故分析 (一般限制)
+# ============================================================
+print("\n===== RUNNING N-1 CONTINGENCY (STANDARD LIMITS) AT WORST HOUR =====")
+df_n1_std = run_full_n1(net, switch_configs, lines_to_test, v_min_limit=0.90, v_max_limit=1.10, loading_limit=100.0)
+
+# 顯示一般限制下無法通過任何 Configuration 的線路
+failed_lines_std = df_n1_std.groupby('Outage_Line_Idx')['Violation'].all()
+print("Lines that FAIL N-1 test under Standard Limits (no valid configuration):")
+print(failed_lines_std[failed_lines_std == True].index.tolist())
+
+# ============================================================
+# STEP 2.5 最糟負載時段的 N-1 偶發事故分析 (嚴格限制)
+# ============================================================
+print("\n===== RUNNING N-1 CONTINGENCY (STRICT LIMITS) AT WORST HOUR =====")
+df_n1_strict = run_full_n1(net, switch_configs, lines_to_test, v_min_limit=0.95, v_max_limit=1.05, loading_limit=100.0)
+
+# 顯示嚴格限制下無法通過任何 Configuration 的線路
+failed_lines_strict = df_n1_strict.groupby('Outage_Line_Idx')['Violation'].all()
+print("Lines that FAIL N-1 test under Strict Limits (no valid configuration):")
+print(failed_lines_strict[failed_lines_strict == True].index.tolist())
