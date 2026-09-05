@@ -60,30 +60,77 @@ for depot, load_idx in depot_load_indices.items():
 ow = ts.OutputWriter(net, time_steps=range(len(df_profiles)), output_path=None)
 ow.log_variable('res_bus', 'vm_pu')
 ow.log_variable('res_line', 'loading_percent')
+ow.log_variable('res_trafo', 'loading_percent')
 
 # 執行時間序列負載流分析
 print("\n===== RUNNING TIME-SERIES LOAD FLOW =====")
 ts.run_timeseries(net, time_steps=range(len(df_profiles)))
 
 # ============================================================
-# STEP 2.3 分析峰值負載期間與網路效能
+# STEP 2.3 完整網路效能與峰值分析
 # ============================================================
+# 擷取日誌數據
 bus_voltage_log = ow.output['res_bus.vm_pu']
 line_loading_log = ow.output['res_line.loading_percent']
+trafo_loading_log = ow.output['res_trafo.loading_percent']
 
-v_min_all = bus_voltage_log.min().min()
-v_max_all = bus_voltage_log.max().max()
-print(f"Overall Min Voltage: {v_min_all:.4f} pu")
-print(f"Overall Max Voltage: {v_max_all:.4f} pu")
+# 計算每小時的全網極值
+min_v_per_step = bus_voltage_log.min(axis=1)
+max_l_per_step = line_loading_log.max(axis=1)
+max_t_per_step = trafo_loading_log.max(axis=1)
 
-# 找出系統負載最重的一小時 (以線路最大負載為基準)
-max_loading_per_step = line_loading_log.max(axis=1)
-worst_hour = max_loading_per_step.idxmax()
-worst_loading_val = max_loading_per_step.max()
+# 1. 計算四個站點的「總和用電量」，找出物流站點的尖峰需求時刻
+df_profiles['Total_Depot_Load_MW'] = df_profiles[['ICA', 'PostNord', 'Mathem', 'Airmee']].sum(axis=1)
+peak_depot_hour = df_profiles['Total_Depot_Load_MW'].idxmax()
+peak_depot_load = df_profiles['Total_Depot_Load_MW'].max()
 
-print(f"\n===== WORST-CASE LOADING PERIOD =====")
-print(f"Worst Hour Index: {worst_hour}")
-print(f"Max Line Loading during this hour: {worst_loading_val:.2f}%")
+# 2. 分析該尖峰時刻的網路狀態 (Voltage, Line, Transformer)
+peak_min_v = min_v_per_step.loc[peak_depot_hour]
+peak_max_l = max_l_per_step.loc[peak_depot_hour]
+peak_max_t = max_t_per_step.loc[peak_depot_hour]
+
+print(f"\n===== DEPOT PEAK DEMAND ANALYSIS =====")
+print(f"Peak Depot Demand Hour Index: {peak_depot_hour}")
+print(f"Total Depot Load at Peak: {peak_depot_load:.2f} MW")
+print(f"-> Network Min Voltage: {peak_min_v:.4f} pu")
+print(f"-> Network Max Line Loading: {peak_max_l:.2f}%")
+print(f"-> Network Max Trafo Loading: {peak_max_t:.2f}%")
+
+# ============================================================
+# 繪製圖表以回答比較性問題
+# ============================================================
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+
+# 圖表 1：物流站點負載模式 (Daily and Weekly Patterns)
+ax1.plot(df_profiles.index, df_profiles['Total_Depot_Load_MW'], label='Total Depot Load', color='black', linewidth=2)
+ax1.plot(df_profiles.index, df_profiles['ICA'], label='ICA', alpha=0.7)
+ax1.plot(df_profiles.index, df_profiles['PostNord'], label='PostNord', alpha=0.7)
+ax1.plot(df_profiles.index, df_profiles['Mathem'], label='Mathem', alpha=0.7)
+ax1.plot(df_profiles.index, df_profiles['Airmee'], label='Airmee', alpha=0.7)
+ax1.set_ylabel('Load (MW)')
+ax1.set_title('Depot Loading Profiles over 2 Weeks')
+ax1.legend(loc='upper right')
+ax1.grid(True, linestyle='--', alpha=0.5)
+
+# 圖表 2：網路壓力指標比較 (Network Stress Levels)
+ax2.plot(max_l_per_step.index, max_l_per_step, label='Max Line Loading (%)', color='red')
+ax2.plot(max_t_per_step.index, max_t_per_step, label='Max Trafo Loading (%)', color='orange')
+ax2.set_ylabel('Loading (%)')
+ax2.set_xlabel('Hour Index (0-335)')
+
+# 加入電壓軸 (右側)
+ax3 = ax2.twinx()
+ax3.plot(min_v_per_step.index, min_v_per_step, label='Min Voltage (pu)', color='blue')
+ax3.set_ylabel('Voltage (pu)')
+ax3.set_ylim(0.90, 1.05)
+
+ax2.set_title('Network Stress Levels (Loading & Voltage)')
+ax2.legend(loc='upper left')
+ax3.legend(loc='upper right')
+ax2.grid(True, linestyle='--', alpha=0.5)
+
+plt.tight_layout()
+plt.show()
 
 # ============================================================
 # 定義 N-1 執行函式 (掃描所有設定與線路)
@@ -145,9 +192,9 @@ def run_full_n1(net, switch_configs, lines_to_test, v_min_limit, v_max_limit, lo
 # 註：需確保 switch_configs (Base, Config1~3) 已在 Step 1 宣告並存在於記憶體中
 lines_to_test = net.line[~net.line['name'].isin(["Line 14-8", "Line 6-7", "Line 11-4"])].index.values
 
-# 將網路狀態設定為 worst_hour 的負載狀態
+# 將網路狀態設定為 peak_depot_hour 的負載狀態
 for depot, load_idx in depot_load_indices.items():
-    net.load.loc[load_idx, 'p_mw'] = df_profiles.loc[worst_hour, depot]
+    net.load.loc[load_idx, 'p_mw'] = df_profiles.loc[peak_depot_hour, depot]
 
 pp.runpp(net, numba=False)
 
