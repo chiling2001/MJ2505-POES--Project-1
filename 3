@@ -1,0 +1,659 @@
+# ============================================================
+# MJ2505 - Project 1
+# STEP 3 - Designing EV Charging Infrastructure
+
+# Step 3.1 Setup & EV Charging Infrastructure Design
+# Step 3.2 Uncontrolled Infrastructure Impact
+# Step 3.3 N-1 Contingency With Charging
+# Step 3.4 Feasibility Under Strict Limits
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import pandapower as pp
+
+from IPython.display import display
+
+pd.set_option("display.max_rows", None)
+pd.set_option("display.max_columns", None)
+
+required_step2_objects = [
+    "net",
+    "depot_buses",
+    "depot_load_indices",
+    "df_profiles",
+]
+missing_step2_objects = [
+    name for name in required_step2_objects
+    if name not in globals()
+]
+if missing_step2_objects:
+    raise RuntimeError(
+        "Run Step 1 and Step 2 first. Missing objects: "
+        + ", ".join(missing_step2_objects)
+    )
+
+DEPOTS = ["ICA", "PostNord", "Mathem", "Airmee"]
+V_MIN_STANDARD = 0.90
+V_MAX_STANDARD = 1.10
+LOADING_LIMIT = 100.0
+EV_POWER_FACTOR = 0.98
+
+# Replace these example inputs with the group's eFleetScheduler export as needed.
+fleet_design = pd.DataFrame(
+    [
+        {
+            "depot": "ICA",
+            "vehicle_type": "Electric rigid truck",
+            "fleet_size": 8,
+            "battery_capacity_kwh": 300.0,
+            "charging_energy_per_vehicle_kwh": 210.0,
+            "charger_type": "DC fast charger",
+            "charger_power_kw": 150.0,
+            "charger_points": 8,
+            "arrival_hour": 17,
+            "departure_hour": 5,
+        },
+        {
+            "depot": "PostNord",
+            "vehicle_type": "Electric delivery van",
+            "fleet_size": 12,
+            "battery_capacity_kwh": 100.0,
+            "charging_energy_per_vehicle_kwh": 70.0,
+            "charger_type": "DC charger",
+            "charger_power_kw": 50.0,
+            "charger_points": 12,
+            "arrival_hour": 18,
+            "departure_hour": 6,
+        },
+        {
+            "depot": "Mathem",
+            "vehicle_type": "Electric rigid truck",
+            "fleet_size": 6,
+            "battery_capacity_kwh": 300.0,
+            "charging_energy_per_vehicle_kwh": 210.0,
+            "charger_type": "DC fast charger",
+            "charger_power_kw": 150.0,
+            "charger_points": 6,
+            "arrival_hour": 17,
+            "departure_hour": 5,
+        },
+        {
+            "depot": "Airmee",
+            "vehicle_type": "Electric delivery van",
+            "fleet_size": 10,
+            "battery_capacity_kwh": 100.0,
+            "charging_energy_per_vehicle_kwh": 70.0,
+            "charger_type": "DC charger",
+            "charger_power_kw": 50.0,
+            "charger_points": 10,
+            "arrival_hour": 18,
+            "departure_hour": 6,
+        },
+    ]
+)
+
+if set(fleet_design["depot"]) != set(DEPOTS):
+    raise ValueError("Fleet design must contain exactly the configured depots.")
+
+fleet_design["charging_time_hours"] = (
+    fleet_design["charging_energy_per_vehicle_kwh"]
+    / fleet_design["charger_power_kw"]
+)
+fleet_design["peak_charging_power_mw"] = (
+    fleet_design["charger_points"]
+    * fleet_design["charger_power_kw"]
+    * EV_POWER_FACTOR
+    / 1000.0
+)
+fleet_design["daily_energy_mwh"] = (
+    fleet_design["fleet_size"]
+    * fleet_design["charging_energy_per_vehicle_kwh"]
+    / 1000.0
+)
+display(fleet_design)
+
+charging_load_indices = {}
+for row in fleet_design.itertuples(index=False):
+    load_index = pp.create_load(
+        net,
+        bus=depot_buses[row.depot],
+        p_mw=row.peak_charging_power_mw,
+        q_mvar=row.peak_charging_power_mw * np.tan(np.arccos(EV_POWER_FACTOR)),
+        name=f"EV_charging_{row.depot}",
+    )
+    charging_load_indices[row.depot] = load_index
+
+pp.runpp(net, numba=False)
+charging_bus_results = pd.DataFrame(
+    {
+        "depot": DEPOTS,
+        "bus": [depot_buses[depot] for depot in DEPOTS],
+        "voltage_pu": [
+            net.res_bus.loc[depot_buses[depot], "vm_pu"]
+            for depot in DEPOTS
+        ],
+        "peak_charging_power_mw": [
+            fleet_design.loc[
+                fleet_design["depot"] == depot,
+                "peak_charging_power_mw",
+            ].iloc[0]
+            for depot in DEPOTS
+        ],
+    }
+)
+line_loading = net.res_line["loading_percent"]
+trafo_loading = net.res_trafo["loading_percent"]
+charging_bus_results["voltage_violation"] = (
+    (charging_bus_results["voltage_pu"] < V_MIN_STANDARD)
+    | (charging_bus_results["voltage_pu"] > V_MAX_STANDARD)
+)
+
+print("\n===== EV CHARGING INFRASTRUCTURE RESULTS =====")
+display(charging_bus_results)
+print(f"Maximum line loading: {line_loading.max():.2f}%")
+print(f"Maximum transformer loading: {trafo_loading.max():.2f}%")
+print("Voltage violations:", int(charging_bus_results["voltage_violation"].sum()))
+print("Line loading violation:", bool(line_loading.max() > LOADING_LIMIT))
+print("Transformer loading violation:", bool(trafo_loading.max() > LOADING_LIMIT))
+
+# Restore the pre-charging network state for later notebook analysis.
+net.load.drop(index=list(charging_load_indices.values()), inplace=True)
+pp.runpp(net, numba=False)
+print("\nNetwork restored after charging-infrastructure assessment.")
+
+# 0.1 Import 
+import pandapower as pp
+import pandapower.control as control
+import pandapower.timeseries as ts
+from pandapower.timeseries.data_sources.frame_data import DFData
+import pandas as pd
+import numpy as np
+
+from pathlib import Path
+from importlib import resources
+import yaml
+
+from efleetplan import (
+    EnvironmentConfig,
+    PredefinedLibrary,
+    RunConfig,
+    generate_fleet_schedules,
+    generate_graphs,
+)
+
+# ============================================================
+# MJ2505 - Project 1
+# STEP 3
+
+# Step 3.1 Setup & EV Charging Infrastructure Design
+# Step 3.2 Uncontrolled Infrastructure Impact
+# Step 3.3 N-1 Contingency With Charging
+# Step 3.4 Feasibility Under Strict Limits
+# ============================================================
+# Continue inputs from Step 1 & 2
+
+# 0. Setup: create the config folder 
+config_dir = Path("../config")
+
+
+def _bootstrap_config(dest: Path) -> None:
+    template_root = resources.files("efleetplan") / "_config_templates"
+
+    def walk(node, prefix=""):
+        for entry in node.iterdir():
+            rel = f"{prefix}{entry.name}"
+            if entry.is_dir():
+                yield from walk(entry, f"{rel}/")
+            else:
+                yield entry, rel
+
+    for src, rel in walk(template_root):
+        target = dest / rel
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(src.read_bytes())
+
+
+_bootstrap_config(config_dir)
+
+# env.yaml：模擬期間對齊 Step 2 的兩週資料 (2026/1/1 - 2026/1/14)
+env_yaml_path = config_dir / "env.yaml"
+ 
+env_yaml = {
+    "seed": 42, 
+    "simulation": {
+        "start_date": "2026-01-01 00:00:00",
+        "end_date": "2026-01-14 23:00:00",
+        "freq": "h",
+    },
+    "paths": {
+        "consumption_factor_file": "../3_inputs/2_consumption_factor_2026.csv",
+        "output_base": "../4_outputs/3_EVfleet",
+    },
+}
+ 
+with open(env_yaml_path, "w") as f:
+    yaml.safe_dump(env_yaml, f, sort_keys=False)
+ 
+print("\n===== EFLEETPLAN CONFIG BOOTSTRAPPED =====")
+
+# ============================================================
+# STEP 3.1(a)(b)
+# 1. 建立各站點的車隊設定 -> 產生 eFleetScheduler 排程
+# ============================================================
+
+depot_fleet_config = {
+
+    "ICA": {
+        "schedule_name": "schedule_ICA",
+        "n_vehicles": 70,
+        "vehicle_mix": {"renault": 14, "toyota": 56, "custom": 0},
+        "company_type": "food",
+        "schedule_type": "typeb",
+    },
+
+    "Mathem": {
+        "schedule_name": "schedule_Mathem",
+        "n_vehicles": 45,
+        "vehicle_mix": {"renault": 18, "toyota": 27, "custom": 0},
+        "company_type": "food",
+        "schedule_type": "typeb",
+    },
+
+    "PostNord": {
+        "schedule_name": "schedule_PostNord",
+        "n_vehicles": 65,
+        "vehicle_mix": {"renault": 65, "toyota": 0, "custom": 0},
+        "company_type": "mail",
+        "schedule_type": "typeb",
+    },
+
+    "Airmee": {
+        "schedule_name": "schedule_Airmee",
+        "n_vehicles": 20,
+        "vehicle_mix": {"renault": 20, "toyota": 0, "custom": 0},
+        "company_type": "mail",
+        "schedule_type": "typeb",
+    },
+}
+
+# 為四個站點產生車隊排程
+schedules = {}
+schedule_csv_paths = {}
+
+for depot, cfg in depot_fleet_config.items():
+
+    if cfg["n_vehicles"] is None:
+        raise ValueError(
+            f"depot_fleet_config['{depot}']  There is still None not filled, "
+            f"please complete the analysis for 3.1(a)(b) before proceeding."
+        )
+
+    run_yaml_path = config_dir / f"run_FleetSchedule_Config_{depot}.yaml"
+
+    # 把這個 depot 全部的車輛分配給選定的 schedule_type，其餘兩種設為 0
+    schedule_mix = {"typea": 0, "typeb": 0, "custom": 0}
+    schedule_mix[cfg["schedule_type"]] = cfg["n_vehicles"]
+
+    run_yaml = {
+        "schedule_name": cfg["schedule_name"],
+        "fleet": {
+            "n_vehicles": cfg["n_vehicles"],
+            "schedule_mix": schedule_mix,
+            "vehicle_mix": cfg["vehicle_mix"],
+            "company_type": cfg["company_type"],
+        },
+        # 由於我使用 "typeb"，這個 custom_schedule 實際上不會被調用，
+        # 保留是為了避免 YAML 找不到 key 而有error。
+        "custom_schedule": {
+            "average departure weekday": 8,
+            "std deviation departure weekday": 1,
+            "average return weekday": 18,
+            "std deviation return weekday": 1,
+            "average departure weekend": 9,
+            "std deviation departure weekend": 1,
+            "average return weekend": 19,
+            "std deviation return weekend": 1,
+            "minimum departure": 0,
+            "maximum departure": 23,
+            "minimum return": 0,
+            "maximum return": 23,
+        },
+    }
+
+    with open(run_yaml_path, "w") as f:
+        yaml.safe_dump(run_yaml, f, sort_keys=False)
+
+    env = EnvironmentConfig.from_yaml(env_yaml, config_dir)
+    run = RunConfig.from_yaml(run_yaml)
+    predefined = PredefinedLibrary.from_directory(config_dir / "_1_predefined")
+
+    schedule_df = generate_fleet_schedules(env, run, predefined)
+    schedules[depot] = schedule_df
+    schedule_csv_paths[depot] = env.output_base / run.schedule_name / f"{run.schedule_name}.csv"
+
+    print(f"\n===== SCHEDULE GENERATED: {depot} -> {schedule_csv_paths[depot]} =====")
+    display(schedule_df.head())
+
+print("\n===== SCHEDULE COLUMNS (Please check the below CONNECTED_COL) =====")
+print(schedules["ICA"].columns.tolist())
+
+# ============================================================
+# STEP 3.1(c)
+# 2. Based on the results above, designing EV charging infrastructure
+# ============================================================
+# Assume that all connected vehicles are charging at their maximum power rating (PowerRating_kW) and use that to calculate the demand.
+
+CONNECTED_COL = "ChargingStation"     
+CONNECTED_VALUE = 1
+ 
+charging_hourly_kw = {}
+ 
+for depot, schedule_df in schedules.items():
+    is_connected = (schedule_df[CONNECTED_COL] == CONNECTED_VALUE).astype(int)
+    connected_kw = schedule_df["PowerRating_kW"] * is_connected
+ 
+    hourly_kw = (
+        connected_kw
+        .groupby(schedule_df["date"])
+        .sum()
+        .sort_index()
+        .reset_index(drop=True)
+    )
+ 
+
+    if len(hourly_kw) != len(df_profiles):
+        raise ValueError(
+            f"{depot}: schedule_df produced {len(hourly_kw)} hourly_kw entries,"
+            f"It is different from {len(df_profiles)} in df_profiles ,"
+            f"Please check the simulation period settings in env_yaml."
+        )
+ 
+    charging_hourly_kw[depot] = hourly_kw
+ 
+    print(f"\n{depot}: Charging demand at peak = {hourly_kw.max():.1f} kW")
+
+
+# ============================================================
+# STEP 3.2
+# 3. Build EV charging load, add to network, run time-series load flow
+# ============================================================
+# ev_profiles_mw：Charging demand for every charging depot (MW) + Total_EV_Charging_MW
+# combined_depot_profiles_mw：Freight + EV charging total, corresponding to df_profiles in Step 2
+ 
+ev_profiles_mw = pd.DataFrame({
+    depot: charging_hourly_kw[depot] / 1000.0   # kW -> MW
+    for depot in depot_buses.keys()
+})
+ev_profiles_mw["Total_EV_Charging_MW"] = ev_profiles_mw[list(depot_buses.keys())].sum(axis=1)
+ 
+print("\n===== EV CHARGING LOAD PROFILE (MW) =====")
+display(ev_profiles_mw.head())
+ 
+if len(ev_profiles_mw) != len(df_profiles):
+    raise ValueError(
+        "Charging load time points don't match df_profiles from Step 2, "
+        "please ensure the simulation period in env_yaml matches the Excel data period."
+    )
+ 
+combined_depot_profiles_mw = pd.DataFrame({
+    depot: df_profiles[depot] + ev_profiles_mw[depot]
+    for depot in depot_buses.keys()
+})
+combined_depot_profiles_mw["Total_Depot_and_EV_MW"] = (
+    combined_depot_profiles_mw[list(depot_buses.keys())].sum(axis=1)
+)
+ 
+# Build a load for each depot
+charging_load_indices = {}
+for depot, bus_idx in depot_buses.items():
+    idx = pp.create_load(net, bus=bus_idx, p_mw=0, name=f"Depot_{depot}_Charging")
+    charging_load_indices[depot] = idx
+ 
+ds_ev = DFData(ev_profiles_mw[list(depot_buses.keys())])
+for depot, load_idx in charging_load_indices.items():
+    control.ConstControl(
+        net, element='load', variable='p_mw', element_index=[load_idx],
+        data_source=ds_ev, profile_name=depot
+    )
+ 
+
+# res_bus / res_line / res_trafo represent the combined effect of freight and EV charging.
+ow_step3 = ts.OutputWriter(net, time_steps=range(len(ev_profiles_mw)), output_path=None)
+ow_step3.log_variable('res_bus', 'vm_pu')
+ow_step3.log_variable('res_line', 'loading_percent')
+ow_step3.log_variable('res_trafo', 'loading_percent')
+ 
+print("\n===== RUNNING TIME-SERIES LOAD FLOW WITH EV CHARGING (STEP 3.2) =====")
+ts.run_timeseries(net, time_steps=range(len(ev_profiles_mw)))
+ 
+bus_voltage_log_step3 = ow_step3.output['res_bus.vm_pu']
+line_loading_log_step3 = ow_step3.output['res_line.loading_percent']
+trafo_loading_log_step3 = ow_step3.output['res_trafo.loading_percent']
+ 
+min_voltage_per_step_step3 = bus_voltage_log_step3.min(axis=1)
+max_line_loading_per_step_step3 = line_loading_log_step3.max(axis=1)
+max_trafo_loading_per_step_step3 = trafo_loading_log_step3.max(axis=1)
+ 
+peak_network_hour_step3 = combined_depot_profiles_mw["Total_Depot_and_EV_MW"].idxmax()
+ 
+print(f"\n===== STEP 3.2 SUMMARY (freight + EV charging) =====")
+print(f"Peak combined depot+EV demand hour index: {peak_network_hour_step3}")
+print(f"-> Network Min Voltage: {min_voltage_per_step_step3.loc[peak_network_hour_step3]:.4f} pu")
+print(f"-> Network Max Line Loading: {max_line_loading_per_step_step3.loc[peak_network_hour_step3]:.2f}%")
+print(f"-> Network Max Trafo Loading: {max_trafo_loading_per_step_step3.loc[peak_network_hour_step3]:.2f}%")
+
+ 
+step32_impact_comparison = pd.DataFrame({
+    "Metric": ["Min Voltage (pu)", "Max Line Loading (%)", "Max Trafo Loading (%)"],
+    "Step 2 - Freight only": [
+        min_v_per_step.loc[peak_network_hour_step3],
+        max_l_per_step.loc[peak_network_hour_step3],
+        max_t_per_step.loc[peak_network_hour_step3],
+    ],
+    "Step 3.2 - Freight + EV charging": [
+        min_voltage_per_step_step3.loc[peak_network_hour_step3],
+        max_line_loading_per_step_step3.loc[peak_network_hour_step3],
+        max_trafo_loading_per_step_step3.loc[peak_network_hour_step3],
+    ],
+})
+print(f"\n===== STEP 3.2 IMPACT COMPARISON (at hour {peak_network_hour_step3}) =====")
+display(step32_impact_comparison)
+
+ # ============================================================
+# STEP 3.3 / 3.4
+# 4. Functions to set the switches closed and the network to the peak hour of Step 3.2
+# ============================================================
+ 
+def set_all_tie_switches_closed():
+    net.switch.loc[tie_switch_indices["S1"], "closed"] = True
+    net.switch.loc[tie_switch_indices["S2"], "closed"] = True
+    net.switch.loc[tie_switch_indices["S3"], "closed"] = True
+ 
+ 
+def set_step3_peak_hour(hour):
+    for depot, load_idx in depot_load_indices.items():
+        net.load.loc[load_idx, "p_mw"] = df_profiles.loc[hour, depot]
+    for depot, load_idx in charging_load_indices.items():
+        net.load.loc[load_idx, "p_mw"] = ev_profiles_mw.loc[hour, depot]
+ 
+ 
+# ============================================================
+# 5. N-1 analysis function for Step 3.3 & 3.4 (with transformer violation check)
+# ============================================================
+ 
+step3_lines_to_test = lines_to_test  
+V_MIN_STANDARD = V_MIN      
+V_MAX_STANDARD = V_MAX      
+V_MIN_STRICT = 0.95
+V_MAX_STRICT = 1.05
+LOADING_LIMIT = LINE_LIMIT  
+ 
+ 
+def run_step3_n1(net, lines_to_test, v_min_limit, v_max_limit, loading_limit):
+    results = []
+    for line_index in lines_to_test:
+        line_idx_int = int(line_index)
+        line_name = net.line.loc[line_idx_int, "name"]
+        nminus1_cases = {"line": {"index": np.array([line_idx_int])}}
+        try:
+            res = pp.contingency.run_contingency(
+                net, nminus1_cases,
+                pf_options={"numba": False},
+                pf_options_nminus1={"numba": False}
+            )
+ 
+            # ---- BUS: Voltage & Unsupplied Bus ----
+            bus_indices = np.array(res["bus"]["index"])
+            bus_min_values = np.array(res["bus"]["min_vm_pu"], dtype=float)
+            bus_max_values = np.array(res["bus"]["max_vm_pu"], dtype=float)
+ 
+            unsupplied_mask = np.isnan(bus_min_values)
+            unsupplied_buses = bus_indices[unsupplied_mask].tolist()
+ 
+            min_voltage = np.nanmin(bus_min_values) if (~unsupplied_mask).any() else np.nan
+            max_voltage = np.nanmax(bus_max_values) if (~np.isnan(bus_max_values)).any() else np.nan
+ 
+            # ---- LINE：Maximum Loading ----
+            line_indices = np.array(res["line"]["index"])
+            line_loading_values = np.array(res["line"]["max_loading_percent"], dtype=float)
+            max_line_loading = (
+                np.nanmax(line_loading_values) if (~np.isnan(line_loading_values)).any() else np.nan
+            )
+ 
+            # ---- TRANSFORMER：Maximum Loading ----
+            trafo_loading_values = np.array(res["trafo"]["max_loading_percent"], dtype=float)
+            max_trafo_loading = (
+                np.nanmax(trafo_loading_values) if (~np.isnan(trafo_loading_values)).any() else np.nan
+            )
+ 
+            voltage_violation = (
+                (pd.notna(min_voltage) and min_voltage < v_min_limit)
+                or (pd.notna(max_voltage) and max_voltage > v_max_limit)
+            )
+            line_violation = pd.notna(max_line_loading) and max_line_loading > loading_limit
+            trafo_violation = pd.notna(max_trafo_loading) and max_trafo_loading > loading_limit
+ 
+            results.append(
+                {
+                    "outage_line_index": line_index,
+                    "outage_line_name": line_name,
+                    "min_voltage_pu": min_voltage,
+                    "max_voltage_pu": max_voltage,
+                    "max_line_loading_percent": max_line_loading,
+                    "max_trafo_loading_percent": max_trafo_loading,
+                    "unsupplied_bus_indices": unsupplied_buses,
+                    "voltage_violation": voltage_violation,
+                    "line_violation": line_violation,
+                    "trafo_violation": trafo_violation,
+                    "violation": (
+                        voltage_violation
+                        or line_violation
+                        or trafo_violation
+                        or bool(unsupplied_buses)
+                    ),
+                    "error": None,
+                }
+            )
+        except Exception as error:
+            results.append(
+                {
+                    "outage_line_index": line_index,
+                    "outage_line_name": line_name,
+                    "min_voltage_pu": np.nan,
+                    "max_voltage_pu": np.nan,
+                    "max_line_loading_percent": np.nan,
+                    "max_trafo_loading_percent": np.nan,
+                    "unsupplied_bus_indices": [],
+                    "voltage_violation": True,
+                    "line_violation": True,
+                    "trafo_violation": True,
+                    "violation": True,
+                    "error": str(error),
+                }
+            )
+        finally:
+            net.line["in_service"] = original_line_state.copy()
+    return pd.DataFrame(results)
+ 
+ 
+# Use the same peak hour as in Step 3.2 for N-1 analysis.
+set_all_tie_switches_closed()
+set_step3_peak_hour(peak_network_hour_step3)
+pp.runpp(net, numba=False)
+ 
+print("\n===== STEP 3.3 - N-1, STANDARD LIMITS, ALL TIES CLOSED =====")
+n1_step3_standard = run_step3_n1(
+    net=net,
+    lines_to_test=step3_lines_to_test,
+    v_min_limit=V_MIN_STANDARD,
+    v_max_limit=V_MAX_STANDARD,
+    loading_limit=LOADING_LIMIT,
+)
+display(n1_step3_standard)
+ 
+critical_lines_step3_standard = n1_step3_standard[
+    n1_step3_standard["violation"]
+].copy()
+print("\nCritical lines under standard limits:")
+display(critical_lines_step3_standard)
+ 
+print("\n===== STEP 3.4 - N-1, STRICT LIMITS, ALL TIES CLOSED =====")
+n1_step3_strict = run_step3_n1(
+    net=net,
+    lines_to_test=step3_lines_to_test,
+    v_min_limit=V_MIN_STRICT,
+    v_max_limit=V_MAX_STRICT,
+    loading_limit=LOADING_LIMIT,
+)
+display(n1_step3_strict)
+ 
+critical_lines_step3_strict = n1_step3_strict[
+    n1_step3_strict["violation"]
+].copy()
+print("\nCritical lines under strict limits:")
+display(critical_lines_step3_strict)
+ 
+ 
+# ============================================================
+# 6. Final Step 3 summary for report and presentation
+# ============================================================
+step3_summary = pd.DataFrame(
+    {
+        "Metric": [
+            "Peak EV charging demand (MW)",
+            "Peak total depot plus EV demand (MW)",
+            "Minimum voltage at peak total demand (pu)",
+            "Maximum line loading at peak total demand (%)",
+            "Maximum transformer loading at peak total demand (%)",
+            "Critical N-1 lines - standard limits",
+            "Critical N-1 lines - strict limits",
+        ],
+        "Value": [
+            ev_profiles_mw["Total_EV_Charging_MW"].max(),
+            combined_depot_profiles_mw["Total_Depot_and_EV_MW"].max(),
+            min_voltage_per_step_step3.loc[peak_network_hour_step3],
+            max_line_loading_per_step_step3.loc[peak_network_hour_step3],
+            max_trafo_loading_per_step_step3.loc[peak_network_hour_step3],
+            ", ".join(critical_lines_step3_standard["outage_line_name"].astype(str)),
+            ", ".join(critical_lines_step3_strict["outage_line_name"].astype(str)),
+        ],
+    }
+)
+print("\n===== STEP 3 FINAL SUMMARY =====")
+display(step3_summary)
+ 
+ 
+# ============================================================
+# Restore the network to its original state before analysis.
+# ============================================================
+net.switch['closed'] = original_switch_state.copy()
+net.bus['min_vm_pu'] = V_MIN
+net.bus['max_vm_pu'] = V_MAX
+ 
+pp.runpp(net, numba=False)
+print("\n===== NETWORK RESTORED =====")
+print("Power flow converged:", net.converged)
+ 
