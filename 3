@@ -54,7 +54,7 @@ def _bootstrap_config(dest: Path) -> None:
 
 _bootstrap_config(config_dir)
 
-# env.yaml：2 weeks data from Step 2 (2026/1/1 - 2026/1/14)
+# env.yaml：two week data from Step 2 (2026/1/1 - 2026/1/14)
 env_yaml_path = config_dir / "env.yaml"
  
 env_yaml = {
@@ -123,7 +123,7 @@ for depot, cfg in depot_fleet_config.items():
 
     if cfg["n_vehicles"] is None:
         raise ValueError(
-            f"depot_fleet_config['{depot}']  There is still None not filled, "
+            f"depot_fleet_config['{depot}']  There is still None not filled,"
             f"please complete the analysis for 3.1(a)(b) before proceeding."
         )
 
@@ -176,6 +176,7 @@ for depot, cfg in depot_fleet_config.items():
 print("\n===== SCHEDULE COLUMNS (Please check the below CONNECTED_COL) =====")
 print(schedules["ICA"].columns.tolist())
 
+
 # ============================================================
 # STEP 3.1(c)
 # 2. Based on the results above, designing EV charging infrastructure
@@ -211,6 +212,56 @@ for depot, schedule_df in schedules.items():
  
     print(f"\n{depot}: Charging demand at peak = {hourly_kw.max():.1f} kW")
 
+
+# ============================================================
+# STEP 3.1(d)
+# 4. Charging Infrastructure Design Summary
+# ============================================================
+
+infra_design_data = [
+    {
+        "depot": "ICA",
+        "charger_type": "DC Fast Charger (Mix)",
+        "charger_power_kw": "80 & 100",
+        "charger_points": 70, # 14 + 56
+        "installed_capacity_kw": (14 * 80) + (56 * 100),
+        "peak_demand_kw": charging_hourly_kw["ICA"].max()
+    },
+    {
+        "depot": "Mathem",
+        "charger_type": "DC Fast Charger (Mix)",
+        "charger_power_kw": "80 & 100",
+        "charger_points": 45, # 18 + 27
+        "installed_capacity_kw": (18 * 80) + (27 * 100),
+        "peak_demand_kw": charging_hourly_kw["Mathem"].max()
+    },
+    {
+        "depot": "PostNord",
+        "charger_type": "DC Fast Charger",
+        "charger_power_kw": "80",
+        "charger_points": 65, # 65
+        "installed_capacity_kw": 65 * 80,
+        "peak_demand_kw": charging_hourly_kw["PostNord"].max()
+    },
+    {
+        "depot": "Airmee",
+        "charger_type": "DC Fast Charger",
+        "charger_power_kw": "80",
+        "charger_points": 20, # 20
+        "installed_capacity_kw": 20 * 80,
+        "peak_demand_kw": charging_hourly_kw["Airmee"].max()
+    }
+]
+
+charging_infra_design = pd.DataFrame(infra_design_data)
+
+# Make sure that the installed capacity is sufficient to meet the peak demand.
+charging_infra_design["capacity_sufficient"] = (
+    charging_infra_design["installed_capacity_kw"] >= charging_infra_design["peak_demand_kw"]
+)
+
+print("\n===== CHARGING INFRASTRUCTURE DESIGN (STEP 3.1d) =====")
+display(charging_infra_design)
 
 # ============================================================
 # STEP 3.2
