@@ -42,65 +42,46 @@ depot_bus_map = {
 print("Configuration loaded.")
 
 #%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%#
-
 ## Step 4.1 – Market-Driven Smart Charging Optimisation
 
-# ---------- LOAD NORD POOL PRICES (SEK/kWh) + REMAP TO 2026 ----------
+# ---------- LOAD NORD POOL PRICES (SEK/kWh) + REMAP TO AUGUST 2026 ----------
 price_path = INPUT_DIR / "nordpool_prices_SE2_2024.csv"
 prices_df = pd.read_csv(price_path)
-
 print("Nord Pool CSV columns:", list(prices_df.columns))
 
-# ---- Direct mapping for your exact column names ----
-expected_date_col  = "MTU (CET/CEST)"
+expected_date_col = "MTU (CET/CEST)"
 expected_price_col = "Day-ahead Price (SEK/kWh)"
-
 if expected_date_col in prices_df.columns and expected_price_col in prices_df.columns:
     prices_df = prices_df.rename(columns={
-        expected_date_col:  "date",
+        expected_date_col: "date",
         expected_price_col: "price_SEK_per_kWh",
     })
     print("→ Using exact columns: 'MTU (CET/CEST)' and 'Day-ahead Price (SEK/kWh)'.")
 else:
-    date_candidates  = ["date", "Date", "hour", "timestamp", "Time", "DateTime", "MTU (CET/CEST)"]
+    date_candidates = ["date", "Date", "hour", "timestamp", "Time", "DateTime", "MTU (CET/CEST)"]
     price_candidates = ["price_SEK_per_kWh", "SEK/kWh", "Day-ahead Price (SEK/kWh)",
                         "price", "Price", "value"]
-    date_col  = next((c for c in date_candidates  if c in prices_df.columns), None)
+    date_col = next((c for c in date_candidates if c in prices_df.columns), None)
     price_col = next((c for c in price_candidates if c in prices_df.columns), None)
     if date_col is None or price_col is None:
         raise ValueError(f"Could not detect columns. Found: {list(prices_df.columns)}")
     prices_df = prices_df.rename(columns={date_col: "date", price_col: "price_SEK_per_kWh"})
     print(f"→ Auto-detected: '{date_col}' and '{price_col}'.")
 
-# ---- Parse dates explicitly: 1/8/24 0:00:00 = 1 August 2024 ----
 prices_df["date"] = pd.to_datetime(
-    prices_df["date"],
-    format="%d/%m/%y %H:%M:%S",
-    errors="raise",
+    prices_df["date"], format="%d/%m/%y %H:%M:%S", errors="raise"
 )
 prices_df = prices_df.set_index("date").sort_index()
-
 print(f"\nOriginal price index: {prices_df.index.min()} → {prices_df.index.max()}")
 print(f"Original length: {len(prices_df)} hourly rows")
 
-# ============================================================
-# OPTION B: REMAP 2024 PRICES → 2026 SCHEDULE TIMELINE
-# We keep the price VALUES but relabel timestamps so that:
-#   2024-08-01 00:00  →  2026-01-01 00:00
-#   2024-08-01 01:00  →  2026-01-01 01:00
-#   ...
-#   2024-08-14 23:00  →  2026-01-14 23:00
-# ============================================================
+# Keep the 2024 price values, but present them on the August 2026 timeline.
 new_index = pd.date_range(
-    start="2026-01-01 00:00:00",
-    periods=len(prices_df),
-    freq="h",
+    start="2026-08-01 00:00:00", periods=len(prices_df), freq="h"
 )
 prices_df.index = new_index
-
-# Update simulation window to match the remapped index
-START_DATE = "2026-01-01"
-END_DATE   = "2026-01-14"
+START_DATE = "2026-08-01"
+END_DATE = "2026-08-14"
 prices_df = prices_df.loc[START_DATE:END_DATE]
 
 print(f"\nRemapped price index: {prices_df.index.min()} → {prices_df.index.max()}")
@@ -113,209 +94,165 @@ plt.figure(figsize=(14, 4))
 plt.plot(prices_df.index, prices_df["price_SEK_per_kWh"],
          color="darkorange", linewidth=0.8)
 plt.axhline(0, color="grey", linewidth=0.6, linestyle="--")
-plt.xlabel("Time (relabeled to Jan 2026)")
+plt.xlabel("Time")
 plt.ylabel("Price (SEK/kWh)")
-plt.title("Nord Pool SE2 Day-Ahead Prices – Remapped to Jan 1–14, 2026")
+plt.title("Nord Pool SE2 Day-Ahead Prices – Mapped to Aug 1–14, 2026")
 plt.grid(alpha=0.3)
 plt.tight_layout()
 plt.show()
 
 # ---------- LOAD eFleetPlan SCHEDULES ----------
 def schedule_path(depot):
-    """Return the path to the schedule CSV for a depot."""
     candidates = [
         SCHEDULE_DIR / f"schedule_{depot}" / f"schedule_{depot}.csv",
         SCHEDULE_DIR / f"schedule_{depot}.csv",
-        INPUT_DIR    / f"schedule_{depot}.csv",
-        INPUT_DIR    / f"{depot}_depot.csv",
+        INPUT_DIR / f"schedule_{depot}.csv",
+        INPUT_DIR / f"{depot}_depot.csv",
     ]
-    for p in candidates:
-        if p.exists():
-            return p
+    for path in candidates:
+        if path.exists():
+            return path
     raise FileNotFoundError(
         f"No schedule CSV found for {depot}. Tried: "
-        + ", ".join(str(c) for c in candidates)
+        + ", ".join(str(path) for path in candidates)
     )
+
 
 def load_depot_schedule(depot):
     csv_path = schedule_path(depot)
     df = pd.read_csv(csv_path)
-
     print(f"\n--- {depot} schedule: {csv_path} ---")
     print("Columns:", list(df.columns))
 
-    # ---- Date column ----
-    date_candidates = ["date", "Date", "datetime", "timestamp", "Time"]
-    date_col = next((c for c in date_candidates if c in df.columns), None)
+    date_col = next((c for c in ["date", "Date", "datetime", "timestamp", "Time"]
+                     if c in df.columns), None)
+    cons_col = next((c for c in ["Consumption_kWh", "Consumption_kwh", "consumption_kwh",
+                                 "Consumption", "energy_kwh"] if c in df.columns), None)
+    avail_col = next((c for c in ["ChargingStation", "Location", "at_depot", "AtDepot"]
+                      if c in df.columns), None)
+    power_col = next((c for c in ["PowerRating_kW", "PowerRating_kw", "ChargerPower",
+                                  "charger_kw", "Power_kW"] if c in df.columns), None)
     if date_col is None:
         raise ValueError(f"{depot}: no date column found.")
-    df[date_col] = pd.to_datetime(df[date_col])
-    df = df.rename(columns={date_col: "date"})
-
-    # ---- Consumption column ----
-    cons_candidates = ["Consumption_kWh", "Consumption_kwh", "consumption_kwh",
-                       "Consumption", "energy_kwh"]
-    cons_col = next((c for c in cons_candidates if c in df.columns), None)
     if cons_col is None:
         raise ValueError(f"{depot}: no consumption column found.")
-    df = df.rename(columns={cons_col: "consumption_kwh"})
-
-    # ---- Availability column (Location=1 → at depot, ChargingStation=1 → charging) ----
-    avail_candidates = ["ChargingStation", "Location", "at_depot", "AtDepot"]
-    avail_col = next((c for c in avail_candidates if c in df.columns), None)
     if avail_col is None:
         raise ValueError(f"{depot}: no availability column found.")
-    df = df.rename(columns={avail_col: "at_depot"})
 
-    # ---- Charger power column (optional) ----
-    power_candidates = ["PowerRating_kW", "PowerRating_kw", "ChargerPower",
-                        "charger_kw", "Power_kW"]
-    power_col = next((c for c in power_candidates if c in df.columns), None)
+    df[date_col] = pd.to_datetime(df[date_col])
+    df = df.rename(columns={date_col: "date", cons_col: "consumption_kwh", avail_col: "at_depot"})
     if power_col is not None:
         df = df.rename(columns={power_col: "charger_kw"})
     else:
         df["charger_kw"] = CHARGER_POWER_KW[depot]
-        print(f"  No power column found – using fixed {CHARGER_POWER_KW[depot]} kW.")
 
-    # ---- Aggregate across vehicles per hour ----
-    hourly = df.groupby("date").agg(
+    return df.groupby("date").agg(
         consumption_kwh=("consumption_kwh", "sum"),
         at_depot=("at_depot", "max"),
         charger_kw=("charger_kw", "sum"),
     ).sort_index()
 
-    return hourly
-
-# Load all depots
 schedules = {}
 for depot in DEPOTS:
     try:
         schedules[depot] = load_depot_schedule(depot)
         print(f"  → {depot}: {len(schedules[depot])} hourly rows loaded.")
         print(f"    Date range: {schedules[depot].index.min()} → {schedules[depot].index.max()}")
-    except Exception as e:
-        print(f"  ✗ {depot} failed: {e}")
+    except Exception as error:
+        print(f"  ✗ {depot} failed: {error}")
 
-# Align schedules to the (remapped) price index
+# The source schedules are January-dated, but have the same 336 hourly slots.
+# Assign the August presentation index positionally so values are not lost.
 price_index = prices_df.index
 for depot in schedules:
-    schedules[depot] = schedules[depot].reindex(price_index).fillna(0)
-    schedules[depot]["at_depot"] = schedules[depot]["at_depot"].clip(0, 1)
+    schedule = schedules[depot]
+    if len(schedule) != len(price_index):
+        raise ValueError(
+            f"{depot}: schedule has {len(schedule)} hours, "
+            f"but prices have {len(price_index)} hours."
+        )
+    schedule = schedule.copy()
+    schedule.index = price_index
+    schedule["at_depot"] = schedule["at_depot"].clip(0, 1)
+    schedules[depot] = schedule
 
 print(f"\nAll schedules aligned to price index: {len(price_index)} hours")
 print(f"Index range: {price_index.min()} → {price_index.max()}")
 
 # ---------- PuLP OPTIMISATION (per depot, per day) ----------
 def optimise_day(depot_name, day_idx, prices_day, avail_day, max_power_day, energy_need_kwh):
-    """
-    Minimise charging cost for a single depot over 24 hours.
-
-    Parameters
-    ----------
-    depot_name     : str   – depot label (for the model name)
-    day_idx        : int   – day index (for the model name)
-    prices_day     : pd.Series of length 24, SEK/kWh
-    avail_day      : pd.Series of length 24, 1 if at least one vehicle at depot
-    max_power_day  : pd.Series of length 24, total charger kW available
-    energy_need_kwh: float – total energy consumed that day (must be recharged)
-
-    Returns
-    -------
-    charge_opt : list of 24 floats (kW)
-    cost       : float (SEK)
-    status     : str   – solver status
-    """
     model = pl.LpProblem(f"CostMin_{depot_name}_day{day_idx}", pl.LpMinimize)
-
-    # --- Decision variables ---
-    charge     = pl.LpVariable.dicts("charge",     range(T), lowBound=0, cat="Continuous")
+    charge = pl.LpVariable.dicts("charge", range(T), lowBound=0, cat="Continuous")
     cum_energy = pl.LpVariable.dicts("cum_energy", range(T), lowBound=0, cat="Continuous")
 
-    # --- 1. Charger power limit (only when at least one vehicle is at the depot) ---
     for t in range(T):
         model += charge[t] <= max_power_day.iloc[t] * avail_day.iloc[t]
-
-    # --- 2. Cumulative energy tracking ---
-    for t in range(T):
         if t == 0:
             model += cum_energy[t] == charge[t]
         else:
-            model += cum_energy[t] == cum_energy[t-1] + charge[t]
+            model += cum_energy[t] == cum_energy[t - 1] + charge[t]
 
-    # --- 3. Energy requirement by the last available hour ---
     avail_indices = [t for t in range(T) if avail_day.iloc[t] == 1]
-    if len(avail_indices) == 0:
-        # No vehicle at the depot – no charging possible
+    if not avail_indices:
         return [0.0] * T, 0.0, "NoAvailability"
 
-    last_available = max(avail_indices)
-    model += cum_energy[last_available] == energy_need_kwh
-
-    # --- 4. Objective: minimise cost (SEK) ---
+    model += cum_energy[max(avail_indices)] == energy_need_kwh
     model += pl.lpSum(charge[t] * prices_day.iloc[t] for t in range(T))
-
-    # --- 5. Solve ---
     model.solve(pl.PULP_CBC_CMD(msg=False))
 
     if pl.LpStatus[model.status] == "Optimal":
-        charge_opt = [charge[t].varValue for t in range(T)]
-        cost       = pl.value(model.objective)
-        return charge_opt, cost, "Optimal"
-    else:
-        return [0.0] * T, 0.0, pl.LpStatus[model.status]
+        return ([charge[t].varValue for t in range(T)],
+                pl.value(model.objective), "Optimal")
+    return [0.0] * T, 0.0, pl.LpStatus[model.status]
 
 print("Optimisation function defined.")
 
 # ---------- FULL OPTIMISATION LOOP ----------
 results = {}
-
 for depot in DEPOTS:
     print(f"\n=== Optimising {depot} ===")
     schedule = schedules[depot]
     depot_charge = []
-    depot_costs  = []
+    depot_costs = []
     day_statuses = []
 
     for day in range(N_DAYS):
         start = day * T
-        end   = start + T
-
+        end = start + T
         if end > len(schedule):
             break
-
-        prices_day    = prices_df["price_SEK_per_kWh"].iloc[start:end].reset_index(drop=True)
-        avail_day     = schedule["at_depot"].iloc[start:end].reset_index(drop=True)
+        prices_day = prices_df["price_SEK_per_kWh"].iloc[start:end].reset_index(drop=True)
+        avail_day = schedule["at_depot"].iloc[start:end].reset_index(drop=True)
         max_power_day = schedule["charger_kw"].iloc[start:end].reset_index(drop=True)
-        energy_need   = schedule["consumption_kwh"].iloc[start:end].sum()
-
+        energy_need = schedule["consumption_kwh"].iloc[start:end].sum()
         charge_opt, cost, status = optimise_day(
             depot, day, prices_day, avail_day, max_power_day, energy_need
         )
-
         depot_charge.extend(charge_opt)
         depot_costs.append(cost)
         day_statuses.append(status)
-
-        print(f"  Day {day+1:2d} | status={status:14s} | "
+        print(f"  Day {day + 1:2d} | status={status:14s} | "
               f"cost={cost:8.2f} SEK | energy_need={energy_need:8.2f} kWh")
 
     results[depot] = {
-        "charge_kW":   depot_charge,
+        "charge_kW": depot_charge,
         "daily_costs": depot_costs,
-        "total_cost":  sum(depot_costs),
-        "statuses":    day_statuses,
+        "total_cost": sum(depot_costs),
+        "statuses": day_statuses,
     }
-
     print(f"  → {depot} total cost: {results[depot]['total_cost']:.2f} SEK")
     print(f"  → {depot} total energy: {sum(depot_charge):.2f} kWh")
 
 # ---------- SUMMARY ----------
 print("\n" + "=" * 60)
 grand_total = sum(results[d]["total_cost"] for d in results)
-grand_kwh   = sum(sum(results[d]["charge_kW"]) for d in results)
+grand_kwh = sum(sum(results[d]["charge_kW"]) for d in results)
 print(f"TOTAL COST (all depots, 14 days): {grand_total:.2f} SEK")
 print(f"TOTAL ENERGY CHARGED             : {grand_kwh:.2f} kWh")
-print(f"AVERAGE PRICE                    : {grand_total / grand_kwh:.4f} SEK/kWh")
+if grand_kwh > 0:
+    print(f"AVERAGE PRICE                    : {grand_total / grand_kwh:.4f} SEK/kWh")
+else:
+    print("AVERAGE PRICE                    : unavailable (no chargeable energy)")
 print("=" * 60)
 
 # ---------- SAVE RESULTS ----------
@@ -323,23 +260,20 @@ summary_rows = []
 for depot in DEPOTS:
     if depot not in results:
         continue
-    # Build a Series with the remapped 2026 index
     charge_series = pd.Series(
         results[depot]["charge_kW"],
-        index=prices_df.index[: len(results[depot]["charge_kW"])],
+        index=prices_df.index[:len(results[depot]["charge_kW"])],
         name=f"{depot}_charge_kW",
     )
     out_path = OUTPUT_DIR / f"step4_optimal_charging_{depot}.csv"
     charge_series.to_csv(out_path, header=True)
     print(f"Saved {out_path}")
-
+    energy = sum(results[depot]["charge_kW"])
     summary_rows.append({
-        "Depot":              depot,
-        "Total cost (SEK)":   round(results[depot]["total_cost"], 2),
-        "Total energy (kWh)": round(sum(results[depot]["charge_kW"]), 2),
-        "Avg price (SEK/kWh)": round(
-            results[depot]["total_cost"] / sum(results[depot]["charge_kW"]), 4
-        ) if sum(results[depot]["charge_kW"]) > 0 else 0,
+        "Depot": depot,
+        "Total cost (SEK)": round(results[depot]["total_cost"], 2),
+        "Total energy (kWh)": round(energy, 2),
+        "Avg price (SEK/kWh)": round(results[depot]["total_cost"] / energy, 4) if energy > 0 else 0,
     })
 
 summary_df = pd.DataFrame(summary_rows)
@@ -351,36 +285,34 @@ fig, axes = plt.subplots(len(DEPOTS), 1, figsize=(14, 3 * len(DEPOTS)), sharex=T
 for i, depot in enumerate(DEPOTS):
     if depot not in results:
         continue
-    s = pd.Series(results[depot]["charge_kW"],
-                  index=prices_df.index[: len(results[depot]["charge_kW"])])
-    axes[i].plot(s.index, s.values, color="steelblue", linewidth=0.9,
+    profile = pd.Series(
+        results[depot]["charge_kW"],
+        index=prices_df.index[:len(results[depot]["charge_kW"])],
+    )
+    axes[i].plot(profile.index, profile.values, color="steelblue", linewidth=0.9,
                  label=f"{depot} charging")
     axes[i].set_ylabel("kW")
     axes[i].legend(loc="upper right")
     axes[i].grid(alpha=0.3)
 
-# Overlay prices on a twin axis
 for i, depot in enumerate(DEPOTS):
     if depot not in results:
         continue
     ax2 = axes[i].twinx()
-    p = prices_df["price_SEK_per_kWh"].iloc[: len(results[depot]["charge_kW"])]
-    ax2.plot(p.index, p.values, color="darkorange", linewidth=0.6,
+    price = prices_df["price_SEK_per_kWh"].iloc[:len(results[depot]["charge_kW"])]
+    ax2.plot(price.index, price.values, color="darkorange", linewidth=0.6,
              alpha=0.6, label="Price (SEK/kWh)")
     ax2.set_ylabel("SEK/kWh", color="darkorange")
 
 axes[-1].set_xlabel("Time")
-plt.suptitle("Step 4 – Optimal Charging Profiles vs Prices")
+plt.suptitle("Step 4 – Optimal Charging Profiles vs Prices (August 2026)")
 plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "step4_charging_profiles.png", dpi=150)
 plt.show()
-
 print("\nStep 4 optimisation complete.")
 
 
-
 #%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%#
-
 ## Step 4.2 – Network Impact (Time-Series Power Flow)
 
 # ---------- 4.2a RECREATE NETWORK (with depot base loads) ----------
