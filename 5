@@ -1,423 +1,269 @@
 # %%
 import copy
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import pandapower as pp
 import pandapower.networks as pn
 import pulp as pl
+from pathlib import Path
+import matplotlib.pyplot as plt
 
-try:
-    from IPython.display import display
-except ImportError:  # pragma: no cover
-    def display(obj):
-        print(obj)
+## Section 0 – Setup and Configuration
 
-# ---------- Config ----------
+# ---------- PATHS ----------
 PROJECT_ROOT = Path.cwd()
 if not (PROJECT_ROOT / "2_inputs").is_dir():
     PROJECT_ROOT = PROJECT_ROOT.parent
+
 INPUT_DIR = PROJECT_ROOT / "2_inputs"
 SCHEDULE_DIR = PROJECT_ROOT / "3_outputs" / "2_EVfleet"
 OUTPUT_DIR = PROJECT_ROOT / "3_outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-DEPOTS = ["ICA", "Mathem", "PostNord", "Airmee"]
-N_DAYS, T = 14, 24
-START_DATE, END_DATE = "2026-08-01", "2026-08-14"
-depot_bus_map = {"ICA": 12, "PostNord": 1, "Mathem": 14, "Airmee": 8}
-TRAFO_LIMIT_KW = 25000 * 0.60
+# ---------- SIMULATION SETTINGS ----------
+DEPOTS, N_DAYS, T = ["ICA", "Mathem", "PostNord", "Airmee"], 14, 24
+START_DATE = "2026-08-01"
+END_DATE = "2026-08-14"
 
-# ---------- Load prices (Nord Pool SE2, remapped to Aug 2026) ----------
-prices_df = pd.read_csv(INPUT_DIR / "nordpool_prices_SE2_2024.csv")
-prices_df = prices_df.rename(columns={
-    "MTU (CET/CEST)": "date",
-    "Day-ahead Price (SEK/kWh)": "price_SEK_per_kWh",
-})
-prices_df["date"] = pd.to_datetime(prices_df["date"],format="%d/%m/%y %H:%M:%S")
+# Keep the network mapping consistent with the previous steps.
+depot_bus_map = {"ICA": 12, "PostNord": 1, "Mathem": 14, "Airmee": 8}
+
+# Prices (SE2 → Aug 2026)
+prices_df = pd.read_csv(INPUT_DIR / "nordpool_prices_SE2_2024.csv").rename(columns={
+    "MTU (CET/CEST)": "date", "Day-ahead Price (SEK/kWh)": "price_SEK_per_kWh"})
+prices_df["date"] = pd.to_datetime(prices_df["date"], format="%d/%m/%y %H:%M:%S", dayfirst=True)
 prices_df = prices_df.set_index("date").sort_index()
 prices_df.index = pd.date_range(START_DATE, periods=len(prices_df), freq="h")
 prices_df = prices_df.loc[START_DATE:END_DATE]
-print(f"Prices: {len(prices_df)} hours | {prices_df.index.min()} → {prices_df.index.max()}")
 
-# ---------- Load eFleetPlan schedules ----------
-def load_schedule(depot):
-    path = SCHEDULE_DIR / f"schedule_{depot}" / f"schedule_{depot}.csv"
-    df = pd.read_csv(path)
+# Schedules (Jan CSV → Aug labels, positional)
+def load_schedule(d):
+    schedule_path = SCHEDULE_DIR / f"schedule_{d}" / f"schedule_{d}.csv"
+    if not schedule_path.exists():
+        raise FileNotFoundError(f"Schedule file not found: {schedule_path}")
+    df = pd.read_csv(schedule_path)
     df["date"] = pd.to_datetime(df["date"])
-    df = df.rename(columns={
-        "Consumption_kWh": "consumption_kwh",
-        "ChargingStation": "at_depot",
-        "PowerRating_kW": "charger_kw",
-    })
-    hourly = df.groupby("date").agg(
-        consumption_kwh=("consumption_kwh", "sum"),
-        at_depot=("at_depot", "max"),
-        charger_kw=("charger_kw", "sum"),
-    ).sort_index()
-    hourly.index = prices_df.index[:len(hourly)]
-    return hourly
+    df = df.rename(columns={"Consumption_kWh": "kwh", "ChargingStation": "avail", "PowerRating_kW": "kw"})
+    h = df.groupby("date").agg(kwh=("kwh","sum"), avail=("avail","max"), kw=("kw","sum")).sort_index()
+    h.index = prices_df.index[:len(h)]
+    return h
 
 schedules = {d: load_schedule(d) for d in DEPOTS}
 for d in DEPOTS:
-    schedules[d]["at_depot"] = schedules[d]["at_depot"].clip(0, 1)
-    total = schedules[d]["consumption_kwh"].sum()
-    avail = schedules[d]["at_depot"].sum()
-    print(f"{d:<10} total_kWh={total:8.1f}  avail_hours={avail:.0f}")
+    schedules[d]["avail"] = schedules[d]["avail"].clip(0, 1)
 
-# ---------- Load depot base profiles ----------
-freight_profiles = pd.read_excel(
-    INPUT_DIR / "Load_profiles_Freight transports.xlsx",
-    sheet_name="Load_profiles_Freight transport",
-)
-name_map = {
-    "ica": "ICA",
-    "mathem": "Mathem",
-    "postnord": "PostNord",
-    "airmee": "Airmee",
-}
-rename_map = {
-    c: name_map.get(c.strip().lower(), c.strip())
-    for c in freight_profiles.columns
-    if c.strip().lower() in name_map
-}
-freight_profiles = freight_profiles.rename(columns=rename_map)
+# Base profiles
+fp = pd.read_excel(INPUT_DIR / "Load_profiles_Freight transports.xlsx",
+                   sheet_name="Load_profiles_Freight transport")
+fp = fp.rename(columns={c: {"ica":"ICA","mathem":"Mathem","postnord":"PostNord","airmee":"Airmee"}
+                          .get(c.strip().lower(), c) for c in fp.columns})
+fp = fp.iloc[:len(prices_df)].reset_index(drop=True)
 for d in DEPOTS:
-    if d not in freight_profiles.columns:
-        freight_profiles[d] = 0.0
-freight_profiles = freight_profiles.iloc[:len(prices_df)].reset_index(drop=True)
-print(f"Prices: {len(prices_df)} hours | Schedules + base profiles loaded.")
+    if d not in fp.columns: fp[d] = 0.0
+
+# Network
+net_base = pn.create_cigre_network_mv(with_der=False)
+net_base.load[["p_mw","q_mvar"]] /= 2
+net_base.switch["closed"] = True
+depot_load_idx = {d: pp.create_load(net_base, bus=depot_bus_map[d],
+                                     p_mw=0.0, q_mvar=0.0, name=f"depot_{d}") for d in DEPOTS}
+
+# Time-series helper (returns losses too)
+def run_ts(charge_dict):
+    ti = prices_df.index
+    vm = pd.DataFrame(index=ti, columns=net_base.bus.index, dtype=float)
+    load = pd.DataFrame(index=ti, columns=net_base.line.index, dtype=float)
+    trafo = pd.DataFrame(index=ti, columns=net_base.trafo.index, dtype=float)
+    loss = pd.Series(index=ti, dtype=float)
+    loss_lines = pd.DataFrame(index=ti, columns=net_base.line.index, dtype=float)
+    net = copy.deepcopy(net_base)
+    ev = {d: pp.create_load(net, bus=depot_bus_map[d], p_mw=0, q_mvar=0) for d in DEPOTS}
+    for i, t in enumerate(ti):
+        for d in DEPOTS:
+            net.load.at[depot_load_idx[d], "p_mw"] = float(fp[d].iloc[i]) / 1000.0
+            net.load.at[ev[d], "p_mw"] = float(charge_dict[d][i]) / 1000.0
+        pp.runpp(net, verbose=False)
+        vm.loc[t] = net.res_bus["vm_pu"].values
+        load.loc[t] = net.res_line["loading_percent"].values
+        trafo.loc[t] = net.res_trafo["loading_percent"].values
+        loss_lines.loc[t] = net.res_line["pl_mw"].values
+        loss.loc[t] = net.res_line["pl_mw"].sum() + net.res_trafo["pl_mw"].sum()
+    return vm, load, trafo, loss, loss_lines
+
+print(f"Prices {len(prices_df)}h | schedules & profiles loaded")
 
 # %%
-# ============================================================
-# PRECOMPUTE BASE TRAFO LOADING (CIGRE + depots, no EV)
-# Needed so the LP constraint knows the true headroom each hour.
-# ============================================================
-net_probe = pn.create_cigre_network_mv(with_der=False)
-net_probe.load["p_mw"]   /= 2
-net_probe.load["q_mvar"] /= 2
-net_probe.switch["closed"] = True
+## Step 5.1 – Network-Aware Smart Charging Optimisation
 
-probe_idx = {d: pp.create_load(net_probe, bus=depot_bus_map[d],
-                                p_mw=0.0, q_mvar=0.0, name=f"depot_{d}")
-             for d in DEPOTS}
-
-base_trafo_pct = np.zeros(len(prices_df))
-for i in range(len(prices_df)):
+# Marginal Loss Factors: MW-loss increase per MW injected at each depot/hour
+mlf = pd.DataFrame(index=prices_df.index, columns=DEPOTS, dtype=float)
+for i, t in enumerate(prices_df.index):
+    nb = copy.deepcopy(net_base)
     for d in DEPOTS:
-        net_probe.load.at[probe_idx[d], "p_mw"] = \
-            float(freight_profiles[d].iloc[i]) / 1000.0
-    pp.runpp(net_probe, verbose=False)
-    base_trafo_pct[i] = net_probe.res_trafo["loading_percent"].max()
+        nb.load.at[depot_load_idx[d], "p_mw"] = float(fp[d].iloc[i]) / 1000.0
+    pp.runpp(nb, verbose=False)
+    base = nb.res_line["pl_mw"].sum() + nb.res_trafo["pl_mw"].sum()
+    for d, bus in depot_bus_map.items():
+        np_ = copy.deepcopy(nb)
+        pp.create_load(np_, bus=bus, p_mw=1.0, q_mvar=0.0)
+        pp.runpp(np_, verbose=False)
+        mlf.loc[t, d] = (np_.res_line["pl_mw"].sum() + np_.res_trafo["pl_mw"].sum()) - base
+print(f"MLF range: {mlf.values.min():.4f} – {mlf.values.max():.4f} MW/MW\n")
 
-TRAFO_RATING_KW = 25000.0
-base_trafo_kw = base_trafo_pct / 100.0 * TRAFO_RATING_KW
-
-print(f"Base trafo loading (no EV):")
-print(f"  min  = {base_trafo_pct.min():.1f}%  ({base_trafo_kw.min():.0f} kW)")
-print(f"  max  = {base_trafo_pct.max():.1f}%  ({base_trafo_kw.max():.0f} kW)")
-print(f"  mean = {base_trafo_pct.mean():.1f}%  ({base_trafo_kw.mean():.0f} kW)")
-
-# %%
-# ============================================================
-# SYSTEM-WIDE LP WITH SHARED TRANSFORMER CONSTRAINT (SOFT)
-# ============================================================
-def optimise_day_system(day_idx, prices_day, depot_data, trafo_limit_kw):
-    model = pl.LpProblem(f"SystemAware_d{day_idx}", pl.LpMinimize)
-
-    charge = {d: pl.LpVariable.dicts(f"ch_{d}", range(T), lowBound=0)
-              for d in DEPOTS}
-    cum    = {d: pl.LpVariable.dicts(f"ce_{d}", range(T), lowBound=0)
-              for d in DEPOTS}
-    shortfall = pl.LpVariable.dicts("sf", range(T), lowBound=0)
-
-    # ---- Per-depot constraints ----
+# Unified LP — mode 'cost' or 'loss'
+def optimise_day(day, prices_day, mlf_day, dd, mode):
+    m = pl.LpProblem(f"{mode}_{day}", pl.LpMinimize)
+    ch = {d: pl.LpVariable.dicts(f"c_{d}", range(T), lowBound=0) for d in DEPOTS}
+    ce = {d: pl.LpVariable.dicts(f"e_{d}", range(T), lowBound=0) for d in DEPOTS}
     for d in DEPOTS:
-        data = depot_data[d]
         for t in range(T):
-            model += charge[d][t] <= data["max_power"].iloc[t] * data["avail"].iloc[t]
-            model += cum[d][t] == (charge[d][t] if t == 0
-                                   else cum[d][t-1] + charge[d][t])
-
-        avail_idx = [t for t in range(T) if data["avail"].iloc[t] == 1]
-        if avail_idx:
-            model += cum[d][max(avail_idx)] == data["energy_need"]
-
-    # ---- Shared transformer constraint (soft) ----
-    for t in range(T):
-        base_kw = base_trafo_kw[day_idx * T + t]
-        model += (pl.lpSum(charge[d][t] for d in DEPOTS) + shortfall[t]
-                  <= trafo_limit_kw - base_kw)
-
-    # ---- Objective: cost + huge shortfall penalty ----
-    PENALTY = 1000.0   # SEK per kWh shortfall
-    model += (
-        pl.lpSum(charge[d][t] * prices_day.iloc[t]
-                 for d in DEPOTS for t in range(T))
-        + PENALTY * pl.lpSum(shortfall[t] for t in range(T))
+            m += ch[d][t] <= dd[d]["kw"].iloc[t] * dd[d]["avail"].iloc[t]
+            m += ce[d][t] == (ch[d][t] if t == 0 else ce[d][t - 1] + ch[d][t])
+        ai = [t for t in range(T) if dd[d]["avail"].iloc[t] == 1]
+        if ai:
+            m += ce[d][max(ai)] == dd[d]["kwh"]
+    obj = (
+        pl.lpSum(ch[d][t] * prices_day.iloc[t] for d in DEPOTS for t in range(T))
+        if mode == "cost"
+        else pl.lpSum(ch[d][t] * mlf_day[d].iloc[t] for d in DEPOTS for t in range(T))
     )
+    m += obj
+    m.solve(pl.PULP_CBC_CMD(msg=False))
+    return ({d: [ch[d][t].varValue for t in range(T)] for d in DEPOTS} if pl.LpStatus[m.status] == "Optimal" else None)
 
-    model.solve(pl.PULP_CBC_CMD(msg=False))
-
-    if pl.LpStatus[model.status] == "Optimal":
-        profiles = {d: [charge[d][t].varValue for t in range(T)] for d in DEPOTS}
-        total_shortfall = sum(shortfall[t].varValue for t in range(T))
-        # Cost excluding the penalty (what the fleet actually pays for energy)
-        energy_cost = sum(profiles[d][t] * prices_day.iloc[t]
-                          for d in DEPOTS for t in range(T))
-        return profiles, energy_cost, total_shortfall, "Optimal"
-
-    return None, None, None, pl.LpStatus[model.status]
 
 # %%
-# ============================================================
-# RUN OPTIMISATION
-# ============================================================
-results_step5 = {d: {"charge_kw": [], "cost": 0.0} for d in DEPOTS}
-shortfalls = []
+## Step 5.2 – Strategy Generation and Time-Series Simulation
+
+# Uncontrolled: charge ASAP at max power until daily need met
+def unc_day(avail, kw, need):
+    out, rem = [0.0] * T, need
+    for t in range(T):
+        if avail.iloc[t] == 1 and rem > 0:
+            p = min(kw.iloc[t], rem)
+            out[t] = p
+            rem -= p
+            if rem <= 0:
+                break
+    return out
+
+profiles = {mode: {d: [] for d in DEPOTS} for mode in ["unc", "cost", "loss"]}
 
 for day in range(N_DAYS):
-    start, end = day * T, (day + 1) * T
-    if end > len(prices_df):
+    s, e = day * T, (day + 1) * T
+    if e > len(prices_df):
         break
-
-    prices_day = prices_df["price_SEK_per_kWh"].iloc[start:end].reset_index(drop=True)
-
-    depot_data = {
+    prices_day = prices_df["price_SEK_per_kWh"].iloc[s:e].reset_index(drop=True)
+    mlf_day = mlf.iloc[s:e].reset_index(drop=True)
+    dd = {
         d: {
-            "avail":       schedules[d]["at_depot"].iloc[start:end].reset_index(drop=True),
-            "max_power":   schedules[d]["charger_kw"].iloc[start:end].reset_index(drop=True),
-            "energy_need": schedules[d]["consumption_kwh"].iloc[start:end].sum(),
-            "base_load":   freight_profiles[d].iloc[start:end].reset_index(drop=True),
-        } for d in DEPOTS
+            "avail": schedules[d]["avail"].iloc[s:e].reset_index(drop=True),
+            "kw": schedules[d]["kw"].iloc[s:e].reset_index(drop=True),
+            "kwh": schedules[d]["kwh"].iloc[s:e].sum(),
+        }
+        for d in DEPOTS
     }
+    for d in DEPOTS:
+        profiles["unc"][d].extend(unc_day(dd[d]["avail"], dd[d]["kw"], dd[d]["kwh"]))
+    for mode in ["cost", "loss"]:
+        p = optimise_day(day, prices_day, mlf_day, dd, mode)
+        if p:
+            for d in DEPOTS:
+                profiles[mode][d].extend(p[d])
+    print(f"Day {day + 1:2d} done")
 
-    profiles, cost, sf, status = optimise_day_system(
-        day, prices_day, depot_data, TRAFO_LIMIT_KW
-    )
+# Time-series for all three
+print("\nRunning time-series...")
+vm_u, l_u, t_u, loss_u, ll_u = run_ts(profiles["unc"])
+vm_c, l_c, t_c, loss_c, ll_c = run_ts(profiles["cost"])
+vm_l, l_l, t_l, loss_l, ll_l = run_ts(profiles["loss"])
 
-    if status == "Optimal":
-        for d in DEPOTS:
-            results_step5[d]["charge_kw"].extend(profiles[d])
-            results_step5[d]["cost"] += cost / len(DEPOTS)
-        shortfalls.append(sf)
-        print(f"Day {day+1:2d}: cost={cost:8.2f} SEK | shortfall={sf:7.1f} kWh")
-    else:
-        print(f"Day {day+1:2d}: {status}")
-
-total_cost_step5   = sum(results_step5[d]["cost"] for d in DEPOTS)
-total_energy_step5 = sum(sum(results_step5[d]["charge_kw"]) for d in DEPOTS)
-total_shortfall    = sum(shortfalls)
-
-print(f"\nTOTAL: {total_cost_step5:.2f} SEK | {total_energy_step5:.0f} kWh "
-      f"| total shortfall: {total_shortfall:.1f} kWh")
-
-# Save
-for d in DEPOTS:
-    pd.Series(results_step5[d]["charge_kw"],
-              index=prices_df.index[:len(results_step5[d]["charge_kw"])],
-              name=f"{d}_charge_kW").to_csv(
-        OUTPUT_DIR / f"step5_optimal_charging_{d}.csv")
-print("Saved step5_optimal_charging_*.csv")
-
-# %%
-# ============================================================
-# NETWORK SIMULATION + N-1 CONTINGENCY
-# ============================================================
-net_base = pn.create_cigre_network_mv(with_der=False)
-net_base.load["p_mw"]   /= 2
-net_base.load["q_mvar"] /= 2
-net_base.switch["closed"] = True
-
-depot_load_idx = {d: pp.create_load(net_base, bus=depot_bus_map[d],
-                                     p_mw=0.0, q_mvar=0.0, name=f"depot_{d}")
-                  for d in DEPOTS}
-
-def run_time_series(net, charge_dict, base_df):
-    time_index = prices_df.index
-    vm    = pd.DataFrame(index=time_index, columns=net.bus.index,   dtype=float)
-    load  = pd.DataFrame(index=time_index, columns=net.line.index,  dtype=float)
-    trafo = pd.DataFrame(index=time_index, columns=net.trafo.index, dtype=float)
-    net_ev = copy.deepcopy(net)
-    ev_idx = {d: pp.create_load(net_ev, bus=depot_bus_map[d],
-                                p_mw=0.0, q_mvar=0.0, name=f"EV_{d}")
-              for d in DEPOTS}
-
-    for i, t in enumerate(time_index):
-        for d in DEPOTS:
-            if d in base_df.columns:
-                net_ev.load.at[depot_load_idx[d], "p_mw"] = \
-                    float(base_df[d].iloc[i]) / 1000.0
-            net_ev.load.at[ev_idx[d], "p_mw"] = \
-                float(charge_dict[d][i]) / 1000.0
-        pp.runpp(net_ev, verbose=False)
-        vm.loc[t]    = net_ev.res_bus["vm_pu"].values
-        load.loc[t]  = net_ev.res_line["loading_percent"].values
-        trafo.loc[t] = net_ev.res_trafo["loading_percent"].values
-    return vm, load, trafo
-
-step5_profiles = {d: results_step5[d]["charge_kw"] for d in DEPOTS}
-vm_s5, load_s5, trafo_s5 = run_time_series(net_base, step5_profiles, freight_profiles)
-
-print("=== STEP 5 — NORMAL OPERATION ===")
-print(f" Min voltage      : {vm_s5.min().min():.4f} pu")
-print(f" Max line loading : {load_s5.max().max():.1f} %")
-print(f" Max trafo loading: {trafo_s5.max().max():.1f} %")
-
-# ---- N-1 at worst hour ----
-worst = trafo_s5.max(axis=1).idxmax()
-i_w   = trafo_s5.index.get_loc(worst)
-print(f"\nWorst hour: {worst} (idx {i_w})")
-
-net_c = copy.deepcopy(net_base)
-ev_c  = {d: pp.create_load(net_c, bus=depot_bus_map[d],
-                            p_mw=0.0, q_mvar=0.0, name=f"EV_{d}") for d in DEPOTS}
-for d in DEPOTS:
-    if d in freight_profiles.columns:
-        net_c.load.at[depot_load_idx[d], "p_mw"] = \
-            float(freight_profiles[d].iloc[i_w]) / 1000.0
-    net_c.load.at[ev_c[d], "p_mw"] = float(step5_profiles[d][i_w]) / 1000.0
-
-pp.runpp(net_c, verbose=False)
-print(f" Base case at worst hour: Vmin={net_c.res_bus['vm_pu'].min():.4f} pu, "
-      f"Lmax={net_c.res_line['loading_percent'].max():.1f}%, "
-      f"Tmax={net_c.res_trafo['loading_percent'].max():.1f}%")
-
-test_lines = [l for l in net_c.line.index if l not in [12, 13, 14]]
-violations = []
-for lo in test_lines:
-    net_c.line.at[lo, "in_service"] = False
-    if len(pp.topology.unsupplied_buses(net_c)) > 0:
-        violations.append({"line_out": lo, "type": "unsupplied"})
-    else:
+# N-1 at each strategy's worst hour
+def n1(net_base, charge_dict, trafo_df):
+    iw = trafo_df.max(axis=1).idxmax()
+    i = trafo_df.index.get_loc(iw)
+    net = copy.deepcopy(net_base)
+    ev = {d: pp.create_load(net, bus=depot_bus_map[d], p_mw=0, q_mvar=0) for d in DEPOTS}
+    for d in DEPOTS:
+        net.load.at[depot_load_idx[d], "p_mw"] = float(fp[d].iloc[i]) / 1000
+        net.load.at[ev[d], "p_mw"] = float(charge_dict[d][i]) / 1000
+    pp.runpp(net, verbose=False)
+    viol = []
+    for lo in [l for l in net.line.index if l not in [12, 13, 14]]:
+        net.line.at[lo, "in_service"] = False
         try:
-            pp.runpp(net_c, verbose=False)
-            for b, v in net_c.res_bus["vm_pu"].items():
-                if v < 0.9 or v > 1.1:
-                    violations.append({"line_out": lo, "type": "voltage",
-                                       "detail": f"Bus {b}: {v:.4f}"})
-            for l, ld in net_c.res_line["loading_percent"].items():
-                if ld > 100:
-                    violations.append({"line_out": lo, "type": "line_overload",
-                                       "detail": f"Line {l}: {ld:.1f}%"})
-            for t, ld in net_c.res_trafo["loading_percent"].items():
-                if ld > 100:
-                    violations.append({"line_out": lo, "type": "trafo_overload",
-                                       "detail": f"Trafo {t}: {ld:.1f}%"})
-        except Exception as e:
-            violations.append({"line_out": lo, "type": "failed", "detail": str(e)})
-    net_c.line.at[lo, "in_service"] = True
+            pp.runpp(net, verbose=False)
+            if (
+                net.res_bus["vm_pu"].min() < 0.9
+                or net.res_bus["vm_pu"].max() > 1.1
+                or net.res_line["loading_percent"].max() > 100
+                or net.res_trafo["loading_percent"].max() > 100
+            ):
+                viol.append(lo)
+        except Exception:
+            viol.append(lo)
+        finally:
+            net.line.at[lo, "in_service"] = True
+    return iw, viol
 
-viol_df5 = pd.DataFrame(violations)
-print(f"\nN-1 violations: {len(viol_df5)}")
-if len(viol_df5) > 0:
-    print(viol_df5["type"].value_counts())
-    print(f"Critical lines: {sorted(viol_df5['line_out'].unique())}")
+w_u, v_u = n1(net_base, profiles["unc"], t_u)
+w_c, v_c = n1(net_base, profiles["cost"], t_c)
+w_l, v_l = n1(net_base, profiles["loss"], t_l)
+print(f"N-1 viol lines — unc {v_u}, cost-opt {v_c}, loss-opt {v_l}")
+
 
 # %%
-# ============================================================
-# STEP 4 vs STEP 5 COMPARISON
-# ============================================================
-STEP4_COST   = 3472.20
-STEP4_ENERGY = 61842.0
-STEP4_N1     = 4
-UNCONTROLLED_COST = 7030.10
+## Step 5.3 – Results Summary and Strategy Comparison
 
-comparison = pd.DataFrame({
-    "Metric": [
-        "Total cost (SEK)",
-        "Avg price (SEK/kWh)",
-        "Max trafo loading (%)",
-        "Max line loading (%)",
-        "Min voltage (pu)",
-        "N-1 violations",
-    ],
-    "Step 4 (cost-only)": [
-        f"{STEP4_COST:.2f}",
-        f"{STEP4_COST/STEP4_ENERGY:.4f}",
-        "64.4",
-        "49.0",
-        "0.9809",
-        f"{STEP4_N1}",
-    ],
-    "Step 5 (trafo-aware)": [
-        f"{total_cost_step5:.2f}",
-        f"{total_cost_step5/total_energy_step5:.4f}",
-        f"{trafo_s5.max().max():.1f}",
-        f"{load_s5.max().max():.1f}",
-        f"{vm_s5.min().min():.4f}",
-        f"{len(viol_df5)}",
-    ],
+# Costs and loss stats
+def cost(p):
+    return sum(p[d][i] * prices_df["price_SEK_per_kWh"].iloc[i] for d in DEPOTS for i in range(len(p[d])))
+
+delivered = sum(sum(profiles["loss"][d]) for d in DEPOTS)
+c_u, c_c, c_l = cost(profiles["unc"]), cost(profiles["cost"]), cost(profiles["loss"])
+lu, lc, ll = loss_u.sum() * 1000, loss_c.sum() * 1000, loss_l.sum() * 1000
+
+comp = pd.DataFrame({
+    "Metric": ["Cost (SEK)", "Avg price (SEK/kWh)", "Losses (kWh, 2w)", "Losses (%)",
+               "Max trafo (%)", "Max line (%)", "Min V (pu)", "N-1 violating outages", "Critical lines"],
+    "Uncontrolled": [f"{c_u:.0f}", f"{c_u / delivered:.4f}", f"{lu:.0f}", f"{100 * lu / delivered:.2f}%",
+                     f"{t_u.max().max():.1f}", f"{l_u.max().max():.1f}", f"{vm_u.min().min():.4f}",
+                     len(v_u), str(v_u)],
+    "Cost-opt (S4)": [f"{c_c:.0f}", f"{c_c / delivered:.4f}", f"{lc:.0f}", f"{100 * lc / delivered:.2f}%",
+                      f"{t_c.max().max():.1f}", f"{l_c.max().max():.1f}", f"{vm_c.min().min():.4f}",
+                      len(v_c), str(v_c)],
+    "Loss-opt (S5)": [f"{c_l:.0f}", f"{c_l / delivered:.4f}", f"{ll:.0f}", f"{100 * ll / delivered:.2f}%",
+                      f"{t_l.max().max():.1f}", f"{l_l.max().max():.1f}", f"{vm_l.min().min():.4f}",
+                      len(v_l), str(v_l)],
 })
+display(comp)
+comp.to_csv(OUTPUT_DIR / "step5_three_way_comparison.csv", index=False)
 
-print("=" * 70)
-print("STEP 4 vs STEP 5")
-print("=" * 70)
-display(comparison)
+print(f"\nLoss reduction vs uncontrolled: {lu - ll:.0f} kWh ({100 * (lu - ll) / lu:.1f}%)")
+print(f"Loss reduction vs cost-opt    : {lc - ll:.0f} kWh ({100 * (lc - ll) / lc:.1f}%)")
+print(f"Cost premium vs cost-opt      : {c_l - c_c:+.0f} SEK ({100 * (c_l - c_c) / c_c:+.1f}%)")
+print(f"\nLoss concentration (loss-opt, top 5 lines):")
+print(ll_l.sum().sort_values(ascending=False).head(5).to_string())
 
-sav4 = UNCONTROLLED_COST - STEP4_COST
-sav5 = UNCONTROLLED_COST - total_cost_step5
-print(f"\nStep 4 savings vs uncontrolled: {sav4:.2f} SEK ({100*sav4/UNCONTROLLED_COST:.1f}%)")
-print(f"Step 5 savings vs uncontrolled: {sav5:.2f} SEK ({100*sav5/UNCONTROLLED_COST:.1f}%)")
-print(f"Price of security (Step 5 − Step 4): +{total_cost_step5 - STEP4_COST:.2f} SEK")
-print(f"N-1: Step 4 = {STEP4_N1}  →  Step 5 = {len(viol_df5)}")
-
-print(prices_df.index.min(), prices_df.index.max())
-
-
-
-# %%
-# ============================================================
-# TRADE-OFF SWEEP
-# ============================================================
-limits_pct = [55, 58, 60, 62, 65, 70, 100]   # 100 = effectively unconstrained
-sweep_rows = []
-
-for pct in limits_pct:
-    print(f"\n--- Trafo limit {pct}% ---")
-    r = run_step5(25000 * pct / 100.0)
-    sweep_rows.append(r)
-    if r.get("status") == "Optimal":
-        print(f"   cost={r['cost_SEK']:.2f}  trafo={r['trafo_peak_pct']}%  "
-              f"N-1={r['n1_violations']}  shortfall={r['shortfall_kWh']}")
-    else:
-        print(f"   status={r['status']}")
-
-sweep_df = pd.DataFrame(sweep_rows)
-display(sweep_df)
-sweep_df.to_csv(OUTPUT_DIR / "step5_tradeoff_sweep.csv", index=False)
-print("\nSaved step5_tradeoff_sweep.csv")
-
-# %%
-# ============================================================
-# TRADE-OFF PLOT (for report)
-# ============================================================
-fig, ax1 = plt.subplots(figsize=(10, 6))
-
-# Cost (left axis) — only rows with a valid solution
-valid = sweep_df[sweep_df["status"] == "Optimal"]
-
-ax1.plot(valid["limit_pct"], valid["cost_SEK"],
-         marker="o", color="steelblue", linewidth=2, label="Cost (SEK)")
-ax1.set_xlabel("Transformer limit (%)")
-ax1.set_ylabel("Total cost (SEK)", color="steelblue")
-ax1.tick_params(axis="y", labelcolor="steelblue")
-ax1.grid(alpha=0.3)
-
-# N-1 violations (right axis)
-ax2 = ax1.twinx()
-ax2.plot(valid["limit_pct"], valid["n1_violations"],
-         marker="s", color="crimson", linewidth=2, linestyle="--",
-         label="N-1 violations")
-ax2.set_ylabel("N-1 violations", color="crimson")
-ax2.tick_params(axis="y", labelcolor="crimson")
-
-plt.title("Step 5 — Cost vs N-1 Security Trade-off")
-fig.tight_layout()
-plt.savefig(OUTPUT_DIR / "step5_tradeoff.png", dpi=150)
+# Plot
+fig, ax = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
+x = prices_df.index
+for m, col, lbl in [("unc", "red", "Uncontrolled"), ("cost", "steelblue", "Cost-opt"), ("loss", "green", "Loss-opt")]:
+    tot = [sum(profiles[m][d][i] for d in DEPOTS) for i in range(len(x))]
+    ax[0].plot(x, tot, color=col, alpha=0.8, label=lbl)
+    ax[1].plot(x, (loss_u if m == "unc" else loss_c if m == "cost" else loss_l) * 1000, color=col, alpha=0.8, label=lbl)
+    ax[2].plot(x, (t_u if m == "unc" else t_c if m == "cost" else t_l).max(axis=1), color=col, alpha=0.8, label=lbl)
+ax[0].set_ylabel("EV charging (kW)")
+ax[0].legend(); ax[0].grid(alpha=0.3)
+ax[1].set_ylabel("Losses (kWh/h)")
+ax[1].legend(); ax[1].grid(alpha=0.3)
+ax[2].set_ylabel("Trafo loading (%)")
+ax[2].axhline(100, color="grey", linestyle=":")
+ax[2].set_xlabel("Time")
+ax[2].legend(); ax[2].grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "step5_strategy_comparison.png", dpi=150)
 plt.show()
-print("Saved step5_tradeoff.png")
+
 
 
