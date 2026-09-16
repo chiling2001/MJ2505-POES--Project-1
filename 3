@@ -1,4 +1,4 @@
-# 0.1 Import 
+# Import 
 import pandapower as pp
 import pandapower.control as control
 import pandapower.timeseries as ts
@@ -77,7 +77,7 @@ print("\n===== EFLEETPLAN CONFIG BOOTSTRAPPED =====")
 
 # ============================================================
 # STEP 3.1(a)(b)
-# 1. 建立各站點的車隊設定 -> 產生 eFleetScheduler 排程
+# 1. Setup fleet configurations for each depot -> generate eFleetScheduler schedules
 # ============================================================
 
 depot_fleet_config = {
@@ -115,7 +115,7 @@ depot_fleet_config = {
     },
 }
 
-# 為四個站點產生車隊排程
+# Create schedules for 4 depots
 schedules = {}
 schedule_csv_paths = {}
 
@@ -129,7 +129,7 @@ for depot, cfg in depot_fleet_config.items():
 
     run_yaml_path = config_dir / f"run_FleetSchedule_Config_{depot}.yaml"
 
-    # 把這個 depot 全部的車輛分配給選定的 schedule_type，其餘兩種設為 0
+    # Assign all vehicles of this depot to the selected schedule_type, set the other two to 0
     schedule_mix = {"typea": 0, "typeb": 0, "custom": 0}
     schedule_mix[cfg["schedule_type"]] = cfg["n_vehicles"]
 
@@ -141,8 +141,8 @@ for depot, cfg in depot_fleet_config.items():
             "vehicle_mix": cfg["vehicle_mix"],
             "company_type": cfg["company_type"],
         },
-        # 由於我使用 "typeb"，這個 custom_schedule 實際上不會被調用，
-        # 保留是為了避免 YAML 找不到 key 而有error。
+        # Because we chosed to use "typeb", this custom_schedule will not be called,
+        # keeping it is to avoid YAML errors when the key is not found.
         "custom_schedule": {
             "average departure weekday": 8,
             "std deviation departure weekday": 1,
@@ -175,7 +175,6 @@ for depot, cfg in depot_fleet_config.items():
 
 print("\n===== SCHEDULE COLUMNS (Please check the below CONNECTED_COL) =====")
 print(schedules["ICA"].columns.tolist())
-
 
 # ============================================================
 # STEP 3.1(c)
@@ -263,6 +262,34 @@ charging_infra_design["capacity_sufficient"] = (
 print("\n===== CHARGING INFRASTRUCTURE DESIGN (STEP 3.1d) =====")
 display(charging_infra_design)
 
+
+# Data for coincidence factor
+# observed_coincidence = [[Number of vehicles charging at peak hour] ÷ [Total number of vehicles at that depot]
+observed_coincidence_rows = []
+for depot, schedule_df in schedules.items():
+    fleet_size = depot_fleet_config[depot]["n_vehicles"]
+    n_connected_per_hour = (
+        (schedule_df[CONNECTED_COL] == CONNECTED_VALUE)
+        .astype(int)
+        .groupby(schedule_df["date"])
+        .sum()
+    )
+    peak_n_connected = int(n_connected_per_hour.max())
+    observed_coincidence_rows.append({
+        "depot": depot,
+        "fleet_size": fleet_size,
+        "peak_vehicles_connected_simultaneously": peak_n_connected,
+        "observed_coincidence_factor": round(peak_n_connected / fleet_size, 3),
+        "charger_points_installed": int(
+            charging_infra_design.loc[charging_infra_design["depot"] == depot, "charger_points"].iloc[0]
+        ),
+    })
+ 
+observed_coincidence = pd.DataFrame(observed_coincidence_rows)
+print("\n===== OBSERVED CHARGING COINCIDENCE FACTOR (from your own schedule data) =====")
+display(observed_coincidence)
+
+
 # ============================================================
 # STEP 3.2
 # 3. Build EV charging load, add to network, run time-series load flow
@@ -348,8 +375,73 @@ step32_impact_comparison = pd.DataFrame({
 })
 print(f"\n===== STEP 3.2 IMPACT COMPARISON (at hour {peak_network_hour_step3}) =====")
 display(step32_impact_comparison)
+ 
 
- # ============================================================
+ # Full 336-hour time-series plot + violation hour statistics
+fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+ 
+axes[0].plot(min_v_per_step.index, min_v_per_step.values,
+             color="grey", linewidth=0.9, label="Step 2 - Freight only")
+axes[0].plot(min_voltage_per_step_step3.index, min_voltage_per_step_step3.values,
+             color="crimson", linewidth=0.9, label="Step 3.2 - Freight + EV")
+axes[0].axhline(V_MIN, color="black", linestyle="--", linewidth=0.8, label=f"V_MIN = {V_MIN}")
+axes[0].axvline(peak_network_hour_step3, color="orange", linestyle=":", linewidth=1.2)
+axes[0].set_ylabel("Min bus voltage (pu)")
+axes[0].legend(loc="lower left")
+axes[0].grid(alpha=0.3)
+ 
+axes[1].plot(max_l_per_step.index, max_l_per_step.values,
+             color="grey", linewidth=0.9, label="Step 2 - Freight only")
+axes[1].plot(max_line_loading_per_step_step3.index, max_line_loading_per_step_step3.values,
+             color="crimson", linewidth=0.9, label="Step 3.2 - Freight + EV")
+axes[1].axhline(LINE_LIMIT, color="black", linestyle="--", linewidth=0.8, label=f"LINE_LIMIT = {LINE_LIMIT}%")
+axes[1].axvline(peak_network_hour_step3, color="orange", linestyle=":", linewidth=1.2)
+axes[1].set_ylabel("Max line loading (%)")
+axes[1].legend(loc="upper left")
+axes[1].grid(alpha=0.3)
+ 
+axes[2].plot(max_t_per_step.index, max_t_per_step.values,
+             color="grey", linewidth=0.9, label="Step 2 - Freight only")
+axes[2].plot(max_trafo_loading_per_step_step3.index, max_trafo_loading_per_step_step3.values,
+             color="crimson", linewidth=0.9, label="Step 3.2 - Freight + EV")
+axes[2].axhline(TRAFO_LIMIT, color="black", linestyle="--", linewidth=0.8, label=f"TRAFO_LIMIT = {TRAFO_LIMIT}%")
+axes[2].axvline(peak_network_hour_step3, color="orange", linestyle=":", linewidth=1.2)
+axes[2].set_ylabel("Max trafo loading (%)")
+axes[2].set_xlabel("Hour index (0-335)")
+axes[2].legend(loc="upper left")
+axes[2].grid(alpha=0.3)
+ 
+plt.suptitle("Step 3.2 - Freight-only vs Freight+EV over the full 2-week period\n"
+             "(orange dashed line = peak_network_hour_step3)")
+plt.tight_layout()
+plt.savefig("step3_2_full_timeseries.png", dpi=150)
+plt.show()
+ 
+# Violation hour statistics of the full 2-week period
+n_hours_total = len(max_line_loading_per_step_step3)
+violation_hours_summary = pd.DataFrame({
+    "Metric": [
+        "Hours with voltage < V_MIN",
+        "Hours with line loading > LINE_LIMIT",
+        "Hours with trafo loading > TRAFO_LIMIT",
+    ],
+    "Step 2 - Freight only": [
+        int((min_v_per_step < V_MIN).sum()),
+        int((max_l_per_step > LINE_LIMIT).sum()),
+        int((max_t_per_step > TRAFO_LIMIT).sum()),
+    ],
+    "Step 3.2 - Freight + EV": [
+        int((min_voltage_per_step_step3 < V_MIN).sum()),
+        int((max_line_loading_per_step_step3 > LINE_LIMIT).sum()),
+        int((max_trafo_loading_per_step_step3 > TRAFO_LIMIT).sum()),
+    ],
+    "Out of (hours)": [n_hours_total, n_hours_total, n_hours_total],
+})
+print("\n===== STEP 3.2: VIOLATION-HOUR COUNT OVER THE FULL 2-WEEK PERIOD =====")
+display(violation_hours_summary)
+
+
+# ============================================================
 # STEP 3.3 / 3.4
 # 4. Functions to set the switches closed and the network to the peak hour of Step 3.2
 # ============================================================
@@ -502,7 +594,39 @@ critical_lines_step3_strict = n1_step3_strict[
 ].copy()
 print("\nCritical lines under strict limits:")
 display(critical_lines_step3_strict)
+
+
+# ============================================================
+# Step 3.3 vs. Step 2.4
+# ============================================================
+step2_agg = df_n1_std.groupby("Outage_Line_Idx").agg(
+    step2_worst_max_loading_pct=("Max_Loading_%", "max"),
+    step2_worst_min_voltage_pu=("Min_Voltage_pu", "min"),
+    step2_any_config_violation=("Violation", "any"),
+)
+step2_worst_by_line = step2_agg.reset_index()
+step2_worst_by_line["outage_line_name"] = step2_worst_by_line["Outage_Line_Idx"].apply(
+    lambda idx: net.line.loc[int(idx), "name"]
+)
  
+step2_vs_step3_comparison = critical_lines_step3_standard[
+    ["outage_line_name", "max_line_loading_percent", "min_voltage_pu", "violation"]
+].merge(
+    step2_worst_by_line[["outage_line_name", "step2_worst_max_loading_pct",
+                          "step2_worst_min_voltage_pu", "step2_any_config_violation"]],
+    on="outage_line_name",
+    how="outer",
+).rename(columns={
+    "max_line_loading_percent": "step3_3_max_loading_pct_allclosed",
+    "min_voltage_pu": "step3_3_min_voltage_pu_allclosed",
+    "violation": "step3_3_violation_allclosed",
+})
+ 
+print("\n===== STEP 3.3 vs. STEP 2.4 =====")
+print("(Step2.4: worst-case across 4 switch configs at peak_depot_hour | "
+      "Step3.3: 'all switches closed' only at peak_network_hour_step3)")
+display(step2_vs_step3_comparison)
+
  
 # ============================================================
 # 6. Final Step 3 summary for report and presentation
@@ -543,4 +667,5 @@ net.bus['max_vm_pu'] = V_MAX
 pp.runpp(net, numba=False)
 print("\n===== NETWORK RESTORED =====")
 print("Power flow converged:", net.converged)
- 
+
+
