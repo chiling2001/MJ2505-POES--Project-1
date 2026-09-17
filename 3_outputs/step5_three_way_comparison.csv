@@ -1,0 +1,10 @@
+Metric,Uncontrolled,Cost-opt (S4),Loss-opt (S5)
+Cost (SEK),7030,3472,8392
+Avg price (SEK/kWh),0.1137,0.0561,0.1357
+"Losses (kWh, 2w)",31093,31143,31081
+Losses (%),50.28%,50.36%,50.26%
+Max trafo (%),61.6,64.4,60.9
+Max line (%),45.1,49.0,44.2
+Min V (pu),0.9839,0.9809,0.9841
+N-1 violating outages,2,2,0
+Critical lines,"[10, 11]","[10, 11]",[]

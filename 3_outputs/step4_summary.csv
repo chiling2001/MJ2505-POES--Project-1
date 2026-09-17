@@ -1,0 +1,5 @@
+Depot,Total energy (kWh),Uncontrolled cost (SEK),Optimised cost (SEK),Savings (SEK),Savings (%),Optimised avg price (SEK/kWh),Uncontrolled avg price (SEK/kWh)
+ICA,20554.0,2334.91,1101.2,1233.71,52.8,0.0536,0.1136
+Mathem,12434.1,1409.98,683.97,726.01,51.5,0.055,0.1134
+PostNord,22164.7,2526.55,1327.3,1199.26,47.5,0.0599,0.114
+Airmee,6688.7,758.66,359.73,398.92,52.6,0.0538,0.1134
